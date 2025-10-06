@@ -572,6 +572,5 @@ namespace NAudio.Wave
             }
         }
 
-#endregion
     }
 }

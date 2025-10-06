@@ -132,8 +132,6 @@
 
         }
 
-        #endregion
-
         private System.Windows.Forms.TreeView treeView1;
         private System.Windows.Forms.ListView listView1;
         private System.Windows.Forms.ColumnHeader columnHeader1;

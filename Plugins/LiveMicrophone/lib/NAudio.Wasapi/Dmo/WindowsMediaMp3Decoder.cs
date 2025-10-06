@@ -80,8 +80,6 @@ namespace NAudio.Dmo
                 mediaComObject = null;
             }
         }
-
-        #endregion
     }
 
 }

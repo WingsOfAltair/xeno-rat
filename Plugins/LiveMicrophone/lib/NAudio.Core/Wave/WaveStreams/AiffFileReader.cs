@@ -312,7 +312,6 @@ namespace NAudio.Wave
             if (buffer.Length != 2) throw new Exception("Incorrect length for int.");
             return (short)((buffer[0] << 8) | buffer[1]);
         }
-#endregion
 
 
 #region AiffChunk

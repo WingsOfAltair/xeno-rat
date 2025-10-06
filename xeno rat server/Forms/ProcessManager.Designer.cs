@@ -76,8 +76,6 @@ namespace xeno_rat_server.Forms
 
         }
 
-        #endregion
-
         private System.Windows.Forms.TreeView treeView1;
         private System.Windows.Forms.Button button1;
     }

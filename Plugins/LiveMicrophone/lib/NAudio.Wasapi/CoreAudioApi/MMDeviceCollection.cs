@@ -80,7 +80,6 @@ namespace NAudio.CoreAudioApi
             }
         }
 
-        #endregion
 
         #region IEnumerable Members
 

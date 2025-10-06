@@ -58,7 +58,6 @@ namespace NAudio.CoreAudioApi
             Dispose();
         }
 
-        #endregion
 
         /// <summary>
         /// Audio meter information of the audio session.

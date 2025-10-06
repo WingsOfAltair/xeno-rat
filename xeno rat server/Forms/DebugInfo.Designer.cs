@@ -135,8 +135,6 @@
 
         }
 
-        #endregion
-
         private System.Windows.Forms.ListView listView1;
         private System.Windows.Forms.ColumnHeader columnHeader1;
         private System.Windows.Forms.Button button1;

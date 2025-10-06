@@ -521,7 +521,5 @@ namespace NAudio.Wave
             System.Diagnostics.Debug.Assert(false, "WaveFileWriter was not disposed");
             Dispose(false);
         }
-
-        #endregion
     }
 }

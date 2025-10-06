@@ -193,7 +193,6 @@ namespace NAudio.CoreAudioApi
             Dispose();
         }
 
-        #endregion
 
     }
 }

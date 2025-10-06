@@ -120,6 +120,5 @@ namespace NAudio.CoreAudioApi
             }
         }
 
-        #endregion
     }
 }

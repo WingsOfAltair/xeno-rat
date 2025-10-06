@@ -276,6 +276,5 @@ namespace NAudio.Wave.Compression
             Dispose(false);
         }
 
-        #endregion
     }
 }

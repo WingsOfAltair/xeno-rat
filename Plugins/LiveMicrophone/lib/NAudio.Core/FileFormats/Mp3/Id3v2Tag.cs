@@ -203,7 +203,6 @@ namespace NAudio.Wave
             return ms;
         }
 
-        #endregion
 
         private Id3v2Tag(Stream input)
         {

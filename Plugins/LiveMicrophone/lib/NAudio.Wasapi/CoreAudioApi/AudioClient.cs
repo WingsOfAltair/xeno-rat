@@ -395,6 +395,5 @@ namespace NAudio.CoreAudioApi
             }
         }
 
-        #endregion
     }
 }

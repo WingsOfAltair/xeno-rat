@@ -177,6 +177,5 @@ namespace NAudio.Utils
             if ((bytes[0] & 0x80) == 0x80) return -f;
             else return f;
         }
-        #endregion
     }
 }

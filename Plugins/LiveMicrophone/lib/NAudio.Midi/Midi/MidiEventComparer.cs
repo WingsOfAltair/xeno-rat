@@ -55,6 +55,5 @@ namespace NAudio.Midi
             return xTime.CompareTo(yTime);
         }
 
-        #endregion
     }
 }

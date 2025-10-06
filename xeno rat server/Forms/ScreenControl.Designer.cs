@@ -164,7 +164,6 @@ namespace xeno_rat_server.Forms
 
         }
 
-        #endregion
 
         private System.Windows.Forms.PictureBox pictureBox1;
         private System.Windows.Forms.ComboBox comboBox1;

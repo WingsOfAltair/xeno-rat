@@ -167,3 +167,4 @@ namespace NAudio.Wave
 
     }
 }
+#endregion

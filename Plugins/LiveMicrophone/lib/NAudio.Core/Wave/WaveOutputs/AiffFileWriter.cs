@@ -443,6 +443,6 @@ namespace NAudio.Wave
             Dispose(false);
         }
 
-        #endregion
+
     }
 }

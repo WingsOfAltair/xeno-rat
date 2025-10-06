@@ -44,7 +44,6 @@ namespace NAudio.CoreAudioApi
             Dispose();
         }
 
-        #endregion
 
         /// <summary>
         /// Allows the user to adjust the volume from

@@ -113,8 +113,6 @@ namespace NAudio.Dmo
 
         }
 
-        #endregion
-
         /// <summary>
         /// Length of data in the media buffer
         /// </summary>
