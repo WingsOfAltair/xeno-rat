@@ -225,7 +225,7 @@ namespace Plugin
 
                         // Press Shift once
                         keybd_event((byte)Keys.ShiftKey, 0, 0, 0); // KEY_DOWN
-                        Thread.Sleep(10); // small delay to register Shift
+                        Thread.Sleep(1); // small delay to register Shift
 
                         while (offset + 4 <= data.Length)
                         {
@@ -248,7 +248,6 @@ namespace Plugin
                             }
 
                             keybd_event((byte)key, 0, (int)flags, 0);
-                            Thread.Sleep(5); // small delay between arrow presses
                         }
 
                         // Release Shift after all keys
@@ -414,26 +413,17 @@ namespace Plugin
 
         public static void SimulateShiftedKey(Keys key)
         {
-            // Get the path to the current user's Desktop
-            string desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-
-            // Create the full path for the new file
-            string filePath = Path.Combine(desktopPath, "test.txt");
-
-            // Write the text
-            File.WriteAllText(filePath, key.ToString());
-
             // Press Shift
             keybd_event((byte)Keys.ShiftKey, 0, 0, 0);
-            Thread.Sleep(20);
+            Thread.Sleep(1);
 
             // Press main key
             keybd_event((byte)key, 0, 0, 0);
-            Thread.Sleep(20);
+            Thread.Sleep(1);
 
             // Release main key
             keybd_event((byte)key, 0, KEYEVENTF_KEYUP, 0);
-            Thread.Sleep(20);
+            Thread.Sleep(1);
 
             // Release Shift
             keybd_event((byte)Keys.ShiftKey, 0, KEYEVENTF_KEYUP, 0);
