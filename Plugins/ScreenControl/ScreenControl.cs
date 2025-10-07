@@ -253,6 +253,40 @@ namespace Plugin
                         // Release Shift after all keys
                         keybd_event((byte)Keys.ShiftKey, 0, KEYEVENTF_KEYUP, 0);
                     }
+                    else if (data[0] == 16) // Control + Arrow combo
+                    {
+                        int offset = 1;
+
+                        // Press Shift once
+                        keybd_event((byte)Keys.ControlKey, 0, 0, 0); // KEY_DOWN
+                        Thread.Sleep(1); // small delay to register Shift
+
+                        while (offset + 4 <= data.Length)
+                        {
+                            int combined = node.sock.BytesToInt(data, offset);
+                            offset += 4;
+
+                            int key = combined & 0xFFFF;
+                            int state = (combined >> 16) & 0xFFFF;
+
+                            uint flags = 0;
+
+                            if (state == 0) // KEY_UP
+                                flags |= KEYEVENTF_KEYUP;
+
+                            // Arrow keys need extended flag
+                            if (key == (int)Keys.Left || key == (int)Keys.Right ||
+                                key == (int)Keys.Up || key == (int)Keys.Down)
+                            {
+                                flags |= KEYEVENTF_EXTENDEDKEY;
+                            }
+
+                            keybd_event((byte)key, 0, (int)flags, 0);
+                        }
+
+                        // Release Shift after all keys
+                        keybd_event((byte)Keys.ControlKey, 0, KEYEVENTF_KEYUP, 0);
+                    }
                 }
             }
             catch

