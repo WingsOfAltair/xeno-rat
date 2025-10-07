@@ -16,6 +16,16 @@ namespace Plugin
 {
     public class Main
     {
+
+        [DllImport("user32.dll")]
+        private static extern short VkKeyScan(char ch);
+
+        [DllImport("user32.dll")]
+        private static extern void keybd_event(byte bVk, byte bScan, int dwFlags, int dwExtraInfo);
+
+        private const int KEYEVENTF_KEYDOWN = 0x0000;
+        private const int KEYEVENTF_KEYUP = 0x0002;
+
         Node ImageNode;
         bool playing = false;
         int quality = 100;
@@ -156,12 +166,56 @@ namespace Plugin
                     }
                     else if (data[0] == 12)
                     {
-                        int keyCode = node.sock.BytesToInt(data,1);
-                        InputHandler.SimulateKeyPress(keyCode);
+                        // Single character case
+                        if (data.Length == 5)
+                        {
+                            int charCode = node.sock.BytesToInt(data, 1);
+                            char ch = (char)charCode;
+                            InputHandler.SimulateSingleKey(ch);
+                        }
+
+                        // Combo case (Ctrl + Key, Shift + Key, etc.)
+                        int count = data[1];
+                        if (count <= 0 || count > 4) return;
+
+                        int offset = 2;
+                        var keys = new List<int>();
+                        for (int i = 0; i < count; i++)
+                        {
+                            keys.Add(node.sock.BytesToInt(data, offset));
+                            offset += 4;
+                        }
+
+                        // --- SHIFT + key ---
+                        if (keys.Contains((int)Keys.ShiftKey) && keys.Count == 2)
+                        {
+                            int key = keys.First(k => k != (int)Keys.ShiftKey);
+                            InputHandler.SimulateShiftedKey((Keys)key);
+                        }
+                        else if (keys.Contains((int)Keys.ControlKey) && keys.Count == 2)
+                        {
+                            int key = keys.First(k => k != (int)Keys.ControlKey);
+                            InputHandler.SimulateKeyCombo((int)Keys.ControlKey, key);
+                        }
+                        else
+                        {
+                            InputHandler.SimulateKeyCombo(keys.ToArray());
+                        }
                     }
                     else if (data[0] == 13) 
                     {
                         scale = (double)node.sock.BytesToInt(data,1)/10000.0;
+                    }
+                    else if (data[0] == 14)
+                    {
+                        int combined = node.sock.BytesToInt(data, 1);
+                        int key = combined & 0xFFFF;
+                        int state = (combined >> 16) & 0xFFFF;
+
+                        if (state == 1)
+                            keybd_event((byte)key, 0, KEYEVENTF_KEYDOWN, 0);
+                        else
+                            keybd_event((byte)key, 0, KEYEVENTF_KEYUP, 0);
                     }
                 }
             }
@@ -170,6 +224,19 @@ namespace Plugin
                 ImageNode?.Disconnect();
             }
             GC.Collect();
+        }
+        public static void SimulateShiftedKey(Keys key)
+        {
+            // Press Shift down
+            keybd_event((byte)Keys.ShiftKey, 0, KEYEVENTF_KEYDOWN, 0);
+
+            // Press and release main key
+            keybd_event((byte)key, 0, KEYEVENTF_KEYDOWN, 0);
+            Thread.Sleep(5);
+            keybd_event((byte)key, 0, KEYEVENTF_KEYUP, 0);
+
+            // Release Shift
+            keybd_event((byte)Keys.ShiftKey, 0, KEYEVENTF_KEYUP, 0);
         }
 
         /// <summary>
@@ -276,9 +343,6 @@ namespace Plugin
         [DllImport("user32.dll", SetLastError = true)]
         private static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, IntPtr dwExtraInfo);
 
-        private const int KEYEVENTF_KEYDOWN = 0x0000;
-        private const int KEYEVENTF_KEYUP = 0x0002;
-
         /// <summary>
         /// Simulates a keyboard event by generating a sequence of key-down and key-up messages for a specified virtual key.
         /// </summary>
@@ -286,8 +350,17 @@ namespace Plugin
         /// <param name="bScan">The hardware scan code of the key to be pressed.</param>
         /// <param name="dwFlags">Specifies various aspects of function operation. This parameter can be a combination of the following flag values: KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, and KEYEVENTF_UNICODE.</param>
         /// <param name="dwExtraInfo">An additional value associated with the key stroke.</param>
+        /// 
+
+
+        [DllImport("user32.dll")]
+        private static extern short VkKeyScan(char ch);
+
         [DllImport("user32.dll")]
         private static extern void keybd_event(byte bVk, byte bScan, int dwFlags, int dwExtraInfo);
+
+        private const int KEYEVENTF_KEYDOWN = 0x0000;
+        private const int KEYEVENTF_KEYUP = 0x0002;
 
         private const uint MOUSEEVENTF_MOVE = 0x0001;
         private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
@@ -301,6 +374,66 @@ namespace Plugin
         private const uint MOUSEEVENTF_WHEEL = 0x0800;
         private const uint MOUSEEVENTF_HWHEEL = 0x1000;
         private const uint MOUSEEVENTF_ABSOLUTE = 0x8000;
+
+        public static void SimulateShiftedKey(Keys key)
+        {
+            // Press Shift
+            keybd_event((byte)Keys.ShiftKey, 0, KEYEVENTF_KEYDOWN, 0);
+            Thread.Sleep(1);
+
+            // Press main key
+            keybd_event((byte)key, 0, KEYEVENTF_KEYDOWN, 0);
+            Thread.Sleep(1);
+            keybd_event((byte)key, 0, KEYEVENTF_KEYUP, 0);
+
+            // Release Shift
+            Thread.Sleep(1);
+            keybd_event((byte)Keys.ShiftKey, 0, KEYEVENTF_KEYUP, 0);
+        }
+
+        public static void SimulateKeyCombo(params int[] keys)
+        {
+            if (keys == null || keys.Length == 0) return;
+
+            // Press modifier keys first
+            foreach (var key in keys)
+            {
+                if (IsModifierKey(key))
+                    keybd_event((byte)key, 0, KEYEVENTF_KEYDOWN, 0);
+            }
+
+            Thread.Sleep(5);
+
+            // Press main keys
+            foreach (var key in keys)
+            {
+                if (!IsModifierKey(key))
+                    keybd_event((byte)key, 0, KEYEVENTF_KEYDOWN, 0);
+            }
+
+            Thread.Sleep(5);
+
+            // Release main keys in reverse
+            for (int i = keys.Length - 1; i >= 0; i--)
+            {
+                if (!IsModifierKey(keys[i]))
+                    keybd_event((byte)keys[i], 0, KEYEVENTF_KEYUP, 0);
+            }
+
+            Thread.Sleep(5);
+
+            // Release modifier keys
+            for (int i = keys.Length - 1; i >= 0; i--)
+            {
+                if (IsModifierKey(keys[i]))
+                    keybd_event((byte)keys[i], 0, KEYEVENTF_KEYUP, 0);
+            }
+        }
+
+        private static bool IsModifierKey(int key)
+        {
+            return key == (int)Keys.ControlKey || key == (int)Keys.ShiftKey || key == (int)Keys.Menu; // Ctrl, Shift, Alt
+        }
 
         /// <summary>
         /// Simulates a mouse click at the specified screen coordinates.
@@ -437,13 +570,26 @@ namespace Plugin
         /// <remarks>
         /// This method simulates a key press by sending a key-down event followed by a key-up event for the specified key code.
         /// </remarks>
-        public static void SimulateKeyPress(int keyCode)
+        public static void SimulateSingleKey(char ch)
         {
-            // Simulate keydown
-            keybd_event((byte)keyCode, 0, KEYEVENTF_KEYDOWN, 0);
+            short vkey = VkKeyScan(ch);
+            if (vkey == -1) return; // unmapped char
 
-            // Simulate keyup
-            keybd_event((byte)keyCode, 0, KEYEVENTF_KEYUP, 0);
+            byte vk = (byte)(vkey & 0xFF);
+            byte shift = (byte)((vkey >> 8) & 0xFF);
+
+            // Press Shift if needed
+            if ((shift & 1) != 0)
+                keybd_event((byte)Keys.ShiftKey, 0, KEYEVENTF_KEYDOWN, 0);
+
+            // Press and release main key
+            keybd_event(vk, 0, KEYEVENTF_KEYDOWN, 0);
+            Thread.Sleep(5);
+            keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
+
+            // Release Shift
+            if ((shift & 1) != 0)
+                keybd_event((byte)Keys.ShiftKey, 0, KEYEVENTF_KEYUP, 0);
         }
     }
     public class ScreenshotTaker

