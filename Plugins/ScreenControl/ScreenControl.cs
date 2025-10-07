@@ -24,7 +24,8 @@ namespace Plugin
         private static extern void keybd_event(byte bVk, byte bScan, int dwFlags, int dwExtraInfo);
 
         private const int KEYEVENTF_KEYDOWN = 0x0000;
-        private const int KEYEVENTF_KEYUP = 0x0002;
+        private const int KEYEVENTF_KEYUP = 0x0002; 
+        const int KEYEVENTF_EXTENDEDKEY = 0x0001;
 
         Node ImageNode;
         bool playing = false;
@@ -78,6 +79,7 @@ namespace Plugin
                         ImageNode?.Disconnect();
                         break;
                     }
+
                     if (data[0] == 0)
                     {
                         playing = true;
@@ -216,6 +218,41 @@ namespace Plugin
                             keybd_event((byte)key, 0, KEYEVENTF_KEYDOWN, 0);
                         else
                             keybd_event((byte)key, 0, KEYEVENTF_KEYUP, 0);
+                    }
+                    else if (data[0] == 15) // Shift + Arrow combo
+                    {
+                        int offset = 1;
+
+                        // Press Shift once
+                        keybd_event((byte)Keys.ShiftKey, 0, 0, 0); // KEY_DOWN
+                        Thread.Sleep(10); // small delay to register Shift
+
+                        while (offset + 4 <= data.Length)
+                        {
+                            int combined = node.sock.BytesToInt(data, offset);
+                            offset += 4;
+
+                            int key = combined & 0xFFFF;
+                            int state = (combined >> 16) & 0xFFFF;
+
+                            uint flags = 0;
+
+                            if (state == 0) // KEY_UP
+                                flags |= KEYEVENTF_KEYUP;
+
+                            // Arrow keys need extended flag
+                            if (key == (int)Keys.Left || key == (int)Keys.Right ||
+                                key == (int)Keys.Up || key == (int)Keys.Down)
+                            {
+                                flags |= KEYEVENTF_EXTENDEDKEY;
+                            }
+
+                            keybd_event((byte)key, 0, (int)flags, 0);
+                            Thread.Sleep(5); // small delay between arrow presses
+                        }
+
+                        // Release Shift after all keys
+                        keybd_event((byte)Keys.ShiftKey, 0, KEYEVENTF_KEYUP, 0);
                     }
                 }
             }
@@ -377,17 +414,28 @@ namespace Plugin
 
         public static void SimulateShiftedKey(Keys key)
         {
+            // Get the path to the current user's Desktop
+            string desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+
+            // Create the full path for the new file
+            string filePath = Path.Combine(desktopPath, "test.txt");
+
+            // Write the text
+            File.WriteAllText(filePath, key.ToString());
+
             // Press Shift
-            keybd_event((byte)Keys.ShiftKey, 0, KEYEVENTF_KEYDOWN, 0);
-            Thread.Sleep(1);
+            keybd_event((byte)Keys.ShiftKey, 0, 0, 0);
+            Thread.Sleep(20);
 
             // Press main key
-            keybd_event((byte)key, 0, KEYEVENTF_KEYDOWN, 0);
-            Thread.Sleep(1);
+            keybd_event((byte)key, 0, 0, 0);
+            Thread.Sleep(20);
+
+            // Release main key
             keybd_event((byte)key, 0, KEYEVENTF_KEYUP, 0);
+            Thread.Sleep(20);
 
             // Release Shift
-            Thread.Sleep(1);
             keybd_event((byte)Keys.ShiftKey, 0, KEYEVENTF_KEYUP, 0);
         }
 

