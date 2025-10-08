@@ -171,7 +171,14 @@ namespace xeno_rat_server.Forms
 
                 // Create and add ListView item
                 ListViewItem lvi = new ListViewItem($"{destAddr}:{destPort}");
-                listView1?.BeginInvoke((MethodInvoker)(() => listView1.Items.Add(lvi)));
+                listView1?.BeginInvoke((MethodInvoker)(() => {
+                    listView1.Items.Add(lvi);
+                    listView1.AutoResizeColumn(0, ColumnHeaderAutoResizeStyle.ColumnContent);
+                    if (listView1.Items.Count > 0)
+                    {
+                        listView1.EnsureVisible(listView1.Items.Count - 1);
+                    }
+                }));
 
                 // Start bidirectional relay
                 _ = Task.Run(() => RelayLoop(clientSock, remoteClient, lvi));
