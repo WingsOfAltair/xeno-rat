@@ -16,6 +16,11 @@ namespace Plugin
         bool playing = false;
         Node MicNode;
 
+        // New: audio playback for server -> client (incoming audio from server)
+        private BufferedWaveProvider serverWaveProvider;
+        private WaveOutEvent serverWaveOut;
+        private bool serverPlaying = false;
+
         /// <summary>
         /// Runs the specified node and performs audio operations.
         /// </summary>
@@ -45,15 +50,25 @@ namespace Plugin
                     }
 
                 };
+
+                // Initialize server playback components (they will remain idle until audio arrives)
+                serverWaveProvider = new BufferedWaveProvider(new WaveFormat(44100, 16, 2));
+                serverWaveOut = new WaveOutEvent();
+                serverWaveOut.Init(serverWaveProvider);
+
                 await recvThread(node);
+
                 waveIn.Dispose();
-                MicNode.Disconnect();
+                MicNode?.Disconnect();
+                serverWaveOut?.Stop();
+                serverWaveOut?.Dispose();
             }
             catch 
             {
                 node.Disconnect();
                 MicNode?.Disconnect();
                 waveIn?.Dispose();
+                serverWaveOut?.Dispose();
             }
         }
 
@@ -123,12 +138,49 @@ namespace Plugin
                         }
                         node.AddSubNode(tempnode);
                         MicNode = tempnode;
+
+                        // New: start listening for incoming audio from server on this MicNode
+                        StartMicRecvThread(MicNode);
                     }
                     else
                     {
                         break;
                     }
                 }
+            }
+        }    
+        
+        // New method: receive audio that server sends on MicNode and play it
+        private async void StartMicRecvThread(Node micNode)
+        {
+            try
+            {
+                while (micNode != null && micNode.Connected())
+                {
+                    byte[] audio = await micNode.ReceiveAsync();
+                    if (audio == null) break;
+
+                    // When audio arrives, play it (start output if not already)
+                    serverWaveProvider.AddSamples(audio, 0, audio.Length);
+                    if (!serverPlaying)
+                    {
+                        serverWaveOut.Play();
+                        serverPlaying = true;
+                    }
+                }
+            }
+            catch
+            {
+                // ignore and allow cleanup in upper layers
+            }
+            finally
+            {
+                try
+                {
+                    serverWaveOut?.Stop();
+                }
+                catch { }
+                serverPlaying = false;
             }
         }
     }

