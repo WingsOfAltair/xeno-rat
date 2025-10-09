@@ -155,6 +155,7 @@ namespace xeno_rat_server.Forms
             this.KeyPreview = true;
             this.Name = "ScreenControl";
             this.Text = "ScreenControl";
+            this.FormClosing += new System.Windows.Forms.FormClosingEventHandler(this.ScreenControl_FormClosing);
             this.Load += new System.EventHandler(this.ScreenControl_Load);
             this.KeyDown += new System.Windows.Forms.KeyEventHandler(this.ScreenControl_KeyDown);
             this.KeyPress += new System.Windows.Forms.KeyPressEventHandler(this.ScreenControl_KeyPress);

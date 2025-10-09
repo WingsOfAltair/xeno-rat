@@ -242,7 +242,8 @@ namespace Plugin
 
                             // Arrow keys need extended flag
                             if (key == (int)Keys.Left || key == (int)Keys.Right ||
-                                key == (int)Keys.Up || key == (int)Keys.Down)
+                                key == (int)Keys.Up || key == (int)Keys.Down ||
+                                key == (int)Keys.PageUp || key == (int)Keys.PageDown)
                             {
                                 flags |= KEYEVENTF_EXTENDEDKEY;
                             }
@@ -286,6 +287,17 @@ namespace Plugin
 
                         // Release Shift after all keys
                         keybd_event((byte)Keys.ControlKey, 0, KEYEVENTF_KEYUP, 0);
+                    }
+                    else if (data[0] == 17) // Alt + F4 combo
+                    {
+                        // Alt down
+                        keybd_event((byte)Keys.Menu, 0, 0, 0);
+                        // F4 down
+                        keybd_event((byte)Keys.F4, 0, 0, 0);
+                        // F4 up
+                        keybd_event((byte)Keys.F4, 0, KEYEVENTF_KEYUP, 0);
+                        // Alt up
+                        keybd_event((byte)Keys.Menu, 0, KEYEVENTF_KEYUP, 0);
                     }
                 }
             }
