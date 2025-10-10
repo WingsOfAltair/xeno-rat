@@ -702,7 +702,8 @@ namespace xeno_rat_server.Forms
                 return;
             }
 
-            if (e.KeyCode == Keys.Insert || e.KeyCode == Keys.Delete || e.KeyCode == Keys.Home || e.KeyCode == Keys.End)
+            if (e.KeyCode == Keys.Insert || e.KeyCode == Keys.Delete || e.KeyCode == Keys.Home || e.KeyCode == Keys.End || e.KeyCode == Keys.Scroll ||
+                 e.KeyCode == Keys.Pause || e.KeyCode == Keys.PrintScreen || e.KeyCode == Keys.Sleep)
             {
                 await SendKeyAsync(e.KeyCode);
                 e.Handled = true;
@@ -724,7 +725,8 @@ namespace xeno_rat_server.Forms
             }
 
             // --- Handle letters & numbers (0-9) ---
-            if ((e.KeyCode >= Keys.A && e.KeyCode <= Keys.Z) || (e.KeyCode >= Keys.D0 && e.KeyCode <= Keys.D9))
+            if ((e.KeyCode >= Keys.A && e.KeyCode <= Keys.Z) || (e.KeyCode >= Keys.D0 && e.KeyCode <= Keys.D9) || (e.KeyCode >= Keys.NumPad0 && e.KeyCode <= Keys.NumPad9) ||
+                e.KeyCode <= Keys.Add || e.KeyCode == Keys.Divide || e.KeyCode == Keys.Multiply || e.KeyCode == Keys.Subtract || e.KeyCode == Keys.Decimal)
             {
                 bool capsLockOn = Control.IsKeyLocked(Keys.CapsLock);
 
