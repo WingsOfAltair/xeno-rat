@@ -102,7 +102,7 @@ namespace xeno_rat_server.Forms
             // columnHeader1
             // 
             this.columnHeader1.Text = "Forwarding sites";
-            this.columnHeader1.Width = 1300;
+            this.columnHeader1.Width = 1450;
             // 
             // contextMenuStrip1
             // 
