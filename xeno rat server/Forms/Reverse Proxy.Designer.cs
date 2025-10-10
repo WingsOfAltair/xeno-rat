@@ -35,12 +35,16 @@ namespace xeno_rat_server.Forms
         /// </remarks>
         private void InitializeComponent()
         {
+            this.components = new System.ComponentModel.Container();
             this.textBox1 = new System.Windows.Forms.TextBox();
             this.label1 = new System.Windows.Forms.Label();
             this.button1 = new System.Windows.Forms.Button();
             this.button2 = new System.Windows.Forms.Button();
             this.listView1 = new System.Windows.Forms.ListView();
             this.columnHeader1 = ((System.Windows.Forms.ColumnHeader)(new System.Windows.Forms.ColumnHeader()));
+            this.contextMenuStrip1 = new System.Windows.Forms.ContextMenuStrip(this.components);
+            this.copySelectedItemsToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
+            this.contextMenuStrip1.SuspendLayout();
             this.SuspendLayout();
             // 
             // textBox1
@@ -93,11 +97,26 @@ namespace xeno_rat_server.Forms
             this.listView1.TabIndex = 4;
             this.listView1.UseCompatibleStateImageBehavior = false;
             this.listView1.View = System.Windows.Forms.View.Details;
+            this.listView1.MouseDown += new System.Windows.Forms.MouseEventHandler(this.ListView1_MouseDown);
             // 
             // columnHeader1
             // 
             this.columnHeader1.Text = "Forwarding sites";
             this.columnHeader1.Width = 1300;
+            // 
+            // contextMenuStrip1
+            // 
+            this.contextMenuStrip1.Items.AddRange(new System.Windows.Forms.ToolStripItem[] {
+            this.copySelectedItemsToolStripMenuItem});
+            this.contextMenuStrip1.Name = "contextMenuStrip1";
+            this.contextMenuStrip1.Size = new System.Drawing.Size(182, 26);
+            // 
+            // copySelectedItemsToolStripMenuItem
+            // 
+            this.copySelectedItemsToolStripMenuItem.Name = "copySelectedItemsToolStripMenuItem";
+            this.copySelectedItemsToolStripMenuItem.Size = new System.Drawing.Size(181, 22);
+            this.copySelectedItemsToolStripMenuItem.Text = "Copy Selected Items";
+            this.copySelectedItemsToolStripMenuItem.Click += new System.EventHandler(this.copySelectedItemsToolStripMenuItem_Click);
             // 
             // Reverse_Proxy
             // 
@@ -114,6 +133,7 @@ namespace xeno_rat_server.Forms
             this.Text = "Reverse_Proxy";
             this.FormClosing += new System.Windows.Forms.FormClosingEventHandler(this.Reverse_Proxy_FormClosing);
             this.Load += new System.EventHandler(this.Reverse_Proxy_Load);
+            this.contextMenuStrip1.ResumeLayout(false);
             this.ResumeLayout(false);
             this.PerformLayout();
 
@@ -125,5 +145,7 @@ namespace xeno_rat_server.Forms
         private System.Windows.Forms.Button button2;
         private System.Windows.Forms.ListView listView1;
         private System.Windows.Forms.ColumnHeader columnHeader1;
+        private System.Windows.Forms.ContextMenuStrip contextMenuStrip1;
+        private System.Windows.Forms.ToolStripMenuItem copySelectedItemsToolStripMenuItem;
     }
 }

