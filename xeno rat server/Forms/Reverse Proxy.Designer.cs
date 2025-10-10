@@ -89,7 +89,7 @@ namespace xeno_rat_server.Forms
             this.listView1.HideSelection = false;
             this.listView1.Location = new System.Drawing.Point(33, 82);
             this.listView1.Name = "listView1";
-            this.listView1.Size = new System.Drawing.Size(406, 226);
+            this.listView1.Size = new System.Drawing.Size(1582, 769);
             this.listView1.TabIndex = 4;
             this.listView1.UseCompatibleStateImageBehavior = false;
             this.listView1.View = System.Windows.Forms.View.Details;
@@ -97,12 +97,13 @@ namespace xeno_rat_server.Forms
             // columnHeader1
             // 
             this.columnHeader1.Text = "Forwarding sites";
+            this.columnHeader1.Width = 1300;
             // 
             // Reverse_Proxy
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(6F, 13F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(481, 367);
+            this.ClientSize = new System.Drawing.Size(1627, 863);
             this.Controls.Add(this.listView1);
             this.Controls.Add(this.button2);
             this.Controls.Add(this.button1);
