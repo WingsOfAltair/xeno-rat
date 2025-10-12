@@ -1653,6 +1653,14 @@ namespace xeno_rat_server.Forms
             button2.Enabled = false;
         }
 
+        private void button3_Click(object sender, EventArgs e)
+        {
+            listView1?.BeginInvoke((MethodInvoker)(() =>
+            {
+                listView1.Items.Clear();
+            }));
+        }
+
         private void Reverse_Proxy_FormClosing(object sender, FormClosingEventArgs e)
         {
             _acceptCts?.Cancel();
@@ -2920,6 +2928,5 @@ namespace xeno_rat_server.Forms
                 _cache.Clear();
             }
         }
-
     } // end Reverse_Proxy class
 } // end namespace
